@@ -174,44 +174,7 @@ Reports you asked it to save stay in `network_doctor_reports/` until you delete 
 
 ---
 
-## Running a pilot
-
-If you are trialling this, run it on **three real cases**, not one, and write down two lines for each: **what the tool said**,
-and **what the cause turned out to be**. Those two lines are the whole value of a pilot.
-
-Which three:
-
-1. **One you have already solved.** You can grade the answer against a known truth — the most
-   informative run you will do.
-2. **One that is open right now.** If it names the cause, that is the product working. If it
-   names the wrong one, the saved JSON shows exactly which checks it read to get there.
-3. **One that is healthy.** Ask about something you know is fine. A tool that invents a
-   blocker on working infrastructure is worse than no tool, and this is how you find out.
-
-Worth knowing before you grade it: the checks table in the saved report has a **Measured on**
-column. For the network probes on classic compute it names the cluster that ran them and
-whether that machine was confirmed to be inside your VNet. A probe measures the network of
-the machine that runs it, so that column is the first thing to check when a result looks
-wrong.
-
-### Telling us a verdict was wrong
-
-That is the most useful thing you can send back, and the report is built to be reportable.
-Open an issue with three things:
-
-1. **The `.json` file** from `/Workspace/Users/<you>/network_doctor_reports/` — not a
-   screenshot and not the chat text. The JSON carries every check, its status, its metadata
-   and which network each row was measured on.
-2. **The version** from the report footer (e.g. `v1.0.0`).
-3. **One line saying what the cause turned out to be.**
-
-A case where the right cause was found but ranked second is a different fix from one where it
-was never found at all, and only you can tell us which happened.
-
-The JSON contains resource names, subnet ranges and IP addresses from your network, and never
-any credential — check it against your own sharing rules before attaching it.
-
-### If it does not activate
+## If it does not activate
 
 | What you see | Why | What to do |
 |---|---|---|
