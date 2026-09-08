@@ -7,31 +7,24 @@ Quote it if you need help with a result.
 
 ### Changed
 
-- **The Azure configuration is now read only LIVE — the offline snapshot mode was removed.**
-  Previously, when the notebook could not reach Azure Resource Manager (serverless with a
-  restrictive egress policy), the tool handed you a script to run in Azure Cloud Shell that
-  dumped your network config to a file it then read. That file was a point-in-time copy taken
-  from a different identity; a cluster-start or connectivity problem has to be read from your
-  configuration as it is now. So when the runtime cannot reach ARM, the tool instead names the
-  exact egress to enable — outbound HTTPS to `management.azure.com` and
-  `login.microsoftonline.com` (serverless: Account Console > Settings > Network; classic: the
-  data-plane subnet's route table / NSG / firewall) — and you re-run for a live diagnosis. If
-  your security policy forbids that egress, the report says the Azure layer was not inspected
-  rather than working from a snapshot.
+- **The Azure configuration is read only LIVE — there is no offline snapshot mode.** A
+  cluster-start or connectivity problem is read from your configuration as it is now. When the
+  notebook cannot reach Azure Resource Manager, the tool names the exact egress to enable —
+  outbound HTTPS to `management.azure.com` and `login.microsoftonline.com` (serverless: Account
+  Console > Settings > Network; classic: the data-plane subnet's route table / NSG / firewall)
+  — and you re-run for a live diagnosis. If your security policy forbids that egress, the report
+  says the Azure layer was not inspected.
 
 ### Fixed
 
-- **Cluster-start error codes now route to the cluster-start diagnosis.** A paste of only the
-  Azure termination code — `NPIP_TUNNEL_SETUP_FAILURE`, `NETWORK_CONFIGURATION_FAILURE`,
+- **Cluster-start error codes route to the cluster-start diagnosis.** A paste of only the Azure
+  termination code — `NPIP_TUNNEL_SETUP_FAILURE`, `NETWORK_CONFIGURATION_FAILURE`,
   `SUBNET_EXHAUSTED_FAILURE`, `CONTROL_PLANE_REQUEST_FAILURE`, `DRIVER_UNREACHABLE`,
-  `SECURITY_DAEMON_REGISTRATION_EXCEPTION` — with no "won't start" prose used to be classified
-  as a connectivity problem and then asked for a destination host that a broken cluster does
-  not have. These now go to the cluster-start (Azure-config) diagnosis.
-- **A blackhole default route now leads the cluster-start diagnosis.** When the data-plane
-  subnet's `0.0.0.0/0` route is a blackhole (next hop `None`), that is the root cause of a
-  cluster that cannot bootstrap — but on the cluster-start path it was found as a failing check
-  and never surfaced as the diagnosis, so a lower-severity NSG finding led instead. The route
-  now leads, with the fix (correct the route table) named first.
+  `SECURITY_DAEMON_REGISTRATION_EXCEPTION` — with no prose is classified as a cluster-start
+  (Azure-config) problem rather than a connectivity one.
+- **A blackhole default route leads the cluster-start diagnosis.** When the data-plane subnet's
+  `0.0.0.0/0` route is a blackhole (next hop `None`), it is named as the root cause of a cluster
+  that cannot bootstrap, with the fix (correct the route table) named first.
 
 ## 1.0.0 — 2026-09-01
 
@@ -90,29 +83,6 @@ First release for customers outside Databricks.
   the machine that runs it, so this is what makes a diagnosis checkable by hand.
 - **`Reader` is the only Azure role it needs.** Subscription scope gives the fullest
   coverage; resource-group scope works with less.
-
-### Fixed in this release
-
-- The Databricks **account id** could be asked for indefinitely, and any reply was accepted
-  as the id — so a polite "I'll have to ask our admin" was sent to the account API and the
-  failure read as if the account were misconfigured. The ask now recognises a UUID, says so
-  when it cannot, and after two replies with no id finalizes with the NCC layer honestly
-  marked as not inspected.
-
-- An unexpected internal error used to surface as a raw Python traceback. The entry point now
-  always returns a readable error. (It also used to be able to leave a diagnostic cluster of
-  its own running — the tool no longer creates compute at all, so there is nothing to leak.)
-- A `Connected` VNet peering whose remote hub could not be read was reported as a critical
-  "recreate the peering" — advice to rebuild something that was working, when the service
-  principal simply lacked `Reader` on the hub. Unprovable now degrades to a note instead of
-  a false verdict.
-- Azure discovery ignored the workspace resource id when it was supplied, so a run without
-  access to instance metadata skipped the entire Azure-configuration suite despite having
-  valid credentials and the exact id.
-- The report footer carried a hardcoded version that nothing updated.
-- A run that honestly could not reach a verdict said so in its counts and then said nothing
-  about what would produce one. A storage error diagnosed without an Azure credential now
-  states plainly, in the chat message, that it has no verdict and what would settle it.
 
 ### Known limitations
 

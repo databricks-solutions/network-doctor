@@ -81,7 +81,7 @@ The driver already built the `DiagnosticReport`, the chat prescription, and the 
 2. NEW cell: `displayHTML(nd_render_dashboard(result["session_path"]))`.
 3. Post `result["dashboard_pointer"]` VERBATIM.
 
-The prescription is CHAT text, not a notebook cell: commands (`az ...`) stay in the driver's fenced blocks. Notebook magics (`%md`, `%python`) are forbidden in it — a literal `%md` line has rendered in the customer-facing OPTION A text on two separate occasions. Do not also output a markdown per-check table.
+The prescription is CHAT text, not a notebook cell: commands (`az ...`) stay in the driver's fenced blocks. Notebook magics (`%md`, `%python`) are forbidden in it — they render literally in the chat text. Do not also output a markdown per-check table.
 
 **This is the end of the turn.** Do not write more prose after `displayHTML` — follow-up text has been observed to collapse the inline HTML render in Genie.
 

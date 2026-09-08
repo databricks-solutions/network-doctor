@@ -14,7 +14,7 @@ Open this when `run_network_doctor()` classified the problem as **Path B** (stor
 
 # Storage Access Diagnostic (Path B)
 
-Path B is DRIVER-OWNED. For storage/UC-access symptoms (`PERMISSION_DENIED`, user-delegation key errors, `AuthorizationFailure`, Volume/table access failing), do not hand-run S1-S8 style cells anymore.
+Path B is DRIVER-OWNED. For storage/UC-access symptoms (`PERMISSION_DENIED`, user-delegation key errors, `AuthorizationFailure`, Volume/table access failing), do not hand-run the storage checks as separate cells.
 
 Use the same `run_network_doctor()` loop from Step 1b (NEED_INPUT -> IN_PROGRESS -> DONE). The driver already does all of this deterministically:
 
@@ -40,4 +40,4 @@ The detailed storage implementation lives in code and is the source of truth:
 - `scripts/doctor.py` (`_stage_B`, `_compose_storage_diagnosis`)
 - `scripts/storage_access_checks.py`
 
-If docs and code diverge, follow code + `deploy/gen_docs.py --check` gate, then update docs.
+If docs and code diverge, the code is the source of truth.

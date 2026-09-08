@@ -128,14 +128,13 @@ Leave **Sparse checkout mode** off, then **Create Git folder**. You end up with:
 └── scripts/          twelve Python modules — the diagnostic engine
 ```
 
-That is why the skill sits at the **root** of this repository: the clone has to land those
-three names directly inside `network-doctor/`. **Nothing else is written anywhere** — no
-tables, no schemas, no jobs, no clusters at install time.
+**Nothing else is written anywhere** — no tables, no schemas, no jobs, no clusters at
+install time.
 
 > **While this repository is private**, your workspace needs a Git credential that can read
 > it: your name, top-right → **Settings** → **Linked accounts** → **Git integration**. That
 > is standard Databricks Git folder setup, stored per-user by Databricks; Network Doctor
-> never sees it. Once the repository is public, this step disappears.
+> never sees it.
 
 ### 3. Describe your problem — that is the whole interface
 
@@ -149,15 +148,20 @@ sitting in `.assistant/skills/` by itself:
 
 ![Genie Code picking up the skill from the workspace folder and starting the intake](docs/images/nd-04-genie-activates.png)
 
-That is real behaviour with **no** `.assistant_instructions.md` present — verified by
-deleting it first. If you keep your own Genie Code instructions, Network Doctor does not
-need to be added to them and does not touch them.
-
 From there it asks **one question at a time** and finishes with the diagnosis **as text in
 the chat**. That text is the deliverable: the cause, the fix, the checks that failed, and
 every layer it could not check. It also saves an HTML dashboard and a JSON report under
 `/Workspace/Users/<you>/network_doctor_reports/` — but if the notebook cell that draws the
 dashboard fails to render, you have lost nothing.
+
+### Confirming the skill is enabled
+
+Cloning registers Network Doctor automatically — it shows up under **Genie Code →
+Customizations → Skills** as a **User** skill, already enabled. You do not add it by hand.
+If its toggle is ever off it will not load, so switch it back on here. This panel is also
+where **Add skill** lets you register other skills, by name or by folder path.
+
+![The network-doctor skill enabled under Genie Code → Customizations → Skills](docs/images/nd-05-genie-skills.png)
 
 ### Updating, and removing
 
@@ -168,16 +172,11 @@ an open session may still hold the previous instructions.
 schemas, no jobs, and no cluster to clean up, because Network Doctor never creates compute.
 Reports you asked it to save stay in `network_doctor_reports/` until you delete them.
 
-*(There is also a CLI path that copies the same files with the Databricks CLI, used for
-internal test workspaces. The Git folder is the shorter route, the one that updates with a
-`Pull`, and the one this guide documents.)*
-
 ---
 
 ## Running a pilot
 
-If you are trialling this — as a customer or as the SA walking a customer through it — run it
-on **three real cases**, not one, and write down two lines for each: **what the tool said**,
+If you are trialling this, run it on **three real cases**, not one, and write down two lines for each: **what the tool said**,
 and **what the cause turned out to be**. Those two lines are the whole value of a pilot.
 
 Which three:
@@ -206,9 +205,8 @@ Open an issue with three things:
 2. **The version** from the report footer (e.g. `v1.0.0`).
 3. **One line saying what the cause turned out to be.**
 
-That third line is the part no automated test can produce. A case where the right cause was
-found but ranked second is a different fix from one where it was never found at all, and only
-you can tell us which happened.
+A case where the right cause was found but ranked second is a different fix from one where it
+was never found at all, and only you can tell us which happened.
 
 The JSON contains resource names, subnet ranges and IP addresses from your network, and never
 any credential — check it against your own sharing rules before attaching it.
@@ -302,54 +300,6 @@ flowchart TD
     style PC stroke:#c2410c,stroke-width:2px
 ```
 
-### Progressive disclosure (the skill layer)
-
-The skill is split so the model loads only what it needs each turn — which keeps diagnoses consistent run-to-run:
-
-- **`SKILL.md`** — a slim, always-loaded core (~360 lines): activation triggers, the hard rules, the canonical function registry, the finalize-turn contract, and the "always call `run_network_doctor()` first" rule.
-- **`reference/PATH_A_connectivity.md`, `PATH_B_storage.md`, `PATH_C_cluster_start.md`** — the path-specific procedure, opened **on demand** after the driver classifies the path.
-- **`reference/DIAGNOSTIC_MACHINERY.md`** — shared execution detail (chunked runs, remote exec, re-verification, cleanup, session resume).
-
-### The diagnostic brain (code, not prose)
-
-**Orchestrator (`orchestrator.py`) — knows what to run.** Check dependencies are a DAG; it runs only what makes sense given prior results:
-
-```
-dns ─────────┬─── tcp ────┬─── tls        (only if TCP passes)
-             │            ├─── latency    (only if TCP passes)
-             │            └─── traceroute (only if TCP FAILS)
-             ├─── nsg                     (needs resolved IP + Azure SP)
-             └─── routes                  (needs resolved IP + Azure SP)
-ping ──────── (independent, always runs)
-peering ───── (needs Azure SP)
-pe ────────── (needs Azure SP)
-dns_zones ─── (needs Azure SP)
-ncc_attach ── (only if serverless)
-ncc_pe ────── (only if NCC attached)
-```
-
-If DNS fails, the orchestrator skips TCP, TLS, latency, NSG, and route checks (they all need a resolved IP) — no wasted time, no confusing "secondary failures."
-
-**Correlation engine (`correlation_engine.py`) — knows what it means.** 32 rules across all three paths produce high-confidence, deterministically-ordered diagnoses. A representative subset:
-
-| Pattern detected | Diagnosis | Path |
-|---|---|---|
-| TCP timeout + NSG Deny rule | NSG blocking outbound | A |
-| TCP timeout + route next-hop = None | Blackhole UDR | A |
-| DNS resolves public IP + PE exists | DNS–PE misalignment | A |
-| Peering not Connected | Broken VNet peering | A |
-| `publicNetworkAccess=Disabled` + no storage PE | No private network path to storage (RBAC moot until a path exists) | B |
-| Serverless egress policy blocks target | NCC egress policy denial | B/A |
-| NCC not attached (serverless) | No private connectivity | A/B |
-| NHC + NSG missing AzureDatabricks rules / `NoAzureDatabricksRules` | Subnet NSG missing required rules (flip to AllRules) | C |
-| NHC + forced-tunnel blackhole route | Forced-tunneling blackhole | C |
-| NHC + subnet missing Databricks delegation | Subnet delegation missing | C |
-| Launch failure but ARM clean | Honest "no blocking misconfig found" (no fabrication) | C |
-
-Each diagnosis carries **severity**, a **fix order**, and either a **prescription** (high confidence) or **follow-up questions** (ambiguous). On multi-fault cases the primary diagnosis is chosen by a fixed precedence + `pattern_id` tiebreak, so it never flips between runs.
-
-**Re-verification mode** — after a fix, re-run only the failed checks, carrying passing results forward. No restart from scratch.
-
 ---
 
 ## Diagnostic capabilities
@@ -415,13 +365,12 @@ Network is checked **before** RBAC — if there is no network path, role assignm
   ordinary workspace-user access, not admin. While this repository is private, a Git
   credential that can read it (Settings > Linked accounts).
 - **A classic cluster you start** (for classic-compute Path A diagnostics). The probes must
-  run from inside the workspace VNet, so they run on one of your clusters and the tool asks
-  for its id. **It never creates, starts, stops or deletes compute** — a single-node cluster
-  with a short auto-terminate is enough, and keeping it yours keeps the billing and the
-  teardown where you can see them. Answer `none` to skip it and get the checks that need no
+  run from inside the workspace VNet, so they run on a cluster you provide — the tool asks for
+  its id and **never creates, starts, stops or deletes compute**. A single-node cluster with a
+  short auto-terminate is enough. Answer `none` to skip it and get the checks that need no
   in-VNet probe.
 - **Foundation Model** endpoint for the conversational layer (defaults to Claude on Databricks; any [Foundation Model](https://docs.databricks.com/aws/en/machine-learning/foundation-models/) the workspace can reach works).
-- *(Optional)* **Databricks-backed secret scope** with a read-only Azure Service Principal. `Reader` at the subscription scope is best; `Reader` per resource group/resource works with reduced coverage. (A read-only SP also avoids over-triggering Genie Code's safety classifier.)
+- *(Optional)* **Databricks-backed secret scope** with a read-only Azure Service Principal. `Reader` at the subscription scope is best; `Reader` per resource group/resource works with reduced coverage.
 - *(Optional)* **Databricks Account ID** for serverless NCC checks.
 
 ---
@@ -440,10 +389,9 @@ On the **Databricks** side it writes exactly one kind of thing:
   diagnoses and short excerpts of Azure API error text (topology metadata such as resource
   names, subnets and IP ranges) — never credentials.
 
-**No compute is created.** Network Doctor never calls a clusters API — it does not create,
-start, stop or delete a cluster. The classic probes run on a cluster you started, addressed
-by the id you gave, via the Command Execution API. There is therefore no billable resource
-the tool brings into being, and nothing of ours left behind to clean up.
+**No compute is created.** Network Doctor never calls a clusters API. The classic probes run
+on a cluster you started, addressed by the id you gave, via the Command Execution API — so
+there is no billable resource the tool brings into being.
 
 **Credentials.** Azure service-principal values are read from a Databricks-backed secret
 scope **by key name only** and held in memory for the duration of the run. They are never
@@ -459,18 +407,11 @@ admin only for the optional serverless NCC checks.
 **Data residency.** No data leaves your workspace and your Azure tenant. All Azure and
 Databricks API calls appear in your own audit logs.
 
-**Uninstall.** Delete the Git folder — see
-[Updating, and removing](#updating-and-removing). No tables, schemas or jobs to undo, and
-no compute to stop.
+**Uninstall.** Delete the Git folder — see [Updating, and removing](#updating-and-removing).
 
 ---
 
 ## Project structure
-
-**The skill lives at the root of this repository, and that is deliberate**: cloning the repo
-into `.assistant/skills/network-doctor` has to put `SKILL.md`, `reference/` and `scripts/`
-directly inside that folder, which is where Genie Code and the engine's own path resolution
-both look. A skill nested one level deeper would not be found.
 
 ```
 ├── SKILL.md                        # slim always-loaded core — the skill Genie Code reads
@@ -497,8 +438,7 @@ both look. A skill nested one level deeper would not be found.
 ├── CHANGELOG.md                    # the version in every report's footer
 ├── LICENSE.md
 ├── docs/
-│   ├── images/                     # the screens the install walkthrough shows
-    └── delivery_mechanism_evaluation.md   # why a Genie Code skill (and not MCP)
+│   └── images/                     # the screens the install walkthrough shows
 ```
 
 ---

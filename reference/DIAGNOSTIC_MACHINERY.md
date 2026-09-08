@@ -4,7 +4,7 @@ Shared, path-independent machinery for all three paths: package policy, the exec
 
 ## Step 0: NO package installs — go straight to Step 1
 
-**There is NOTHING to install.** Every script in this skill (including `AzureInfraChecker` — migrated to raw ARM REST) uses only `requests`, which is preinstalled on every Databricks runtime. Do NOT run `%pip install` at ANY point in the session — there is no Azure SDK dependency anymore, and on serverless `%pip install` **resets the Python context**, wiping every variable, function, and `exec`-loaded script (observed in the field). If you catch yourself writing `%pip install azure-...` or `import azure.mgmt...`, STOP — that dependency was removed; the checks call `https://management.azure.com` directly.
+**There is NOTHING to install.** Every script in this skill (including `AzureInfraChecker` — migrated to raw ARM REST) uses only `requests`, which is preinstalled on every Databricks runtime. Do NOT run `%pip install` at ANY point in the session — there is no Azure SDK dependency anymore, and on serverless `%pip install` **resets the Python context**, wiping every variable, function, and `exec`-loaded script. If you catch yourself writing `%pip install azure-...` or `import azure.mgmt...`, STOP — that dependency was removed; the checks call `https://management.azure.com` directly.
 
 ## Execution model — read this once and remember it for the whole session
 
@@ -69,7 +69,7 @@ context dict keys for `diagnose_target` / `start_diagnosis` / `continue_diagnosi
 
 ### 4d. Remote Execution (if on serverless testing classic)
 
-If `ws_ctx['is_serverless']` is True and `compute_type` includes "classic", the network probes (DNS, TCP, TLS, etc.) must run on the classic cluster. **Compute-plane alignment is evidence integrity**: when the customer says the failure is on CLASSIC compute, probe results from THIS serverless session are evidence about the wrong network path (serverless and classic VNets/DNS differ) — do not run them in-session first "for a quick look" and do not present in-session results as findings about the classic path (observed in the field). Go straight to the classic cluster via `run_on_cluster()`; the only in-session steps for a classic problem are ARM reads (they're plane-independent). Build the probe code as a string and use `run_on_cluster()`:
+If `ws_ctx['is_serverless']` is True and `compute_type` includes "classic", the network probes (DNS, TCP, TLS, etc.) must run on the classic cluster. **Compute-plane alignment is evidence integrity**: when the customer says the failure is on CLASSIC compute, probe results from THIS serverless session are evidence about the wrong network path (serverless and classic VNets/DNS differ) — do not run them in-session first "for a quick look" and do not present in-session results as findings about the classic path. Go straight to the classic cluster via `run_on_cluster()`; the only in-session steps for a classic problem are ARM reads (they're plane-independent). Build the probe code as a string and use `run_on_cluster()`:
 
 ```python
 import json
@@ -126,7 +126,7 @@ Then run Azure infra checks and NCC checks locally (API-based, no VNet needed), 
 
 ## Step 7b: Resuming after a session reset / follow-up turn
 
-Genie Code's serverless session can drop in-memory state between turns — `report`, `ws_ctx`, and even the imported skill functions may be gone when the customer sends a follow-up (e.g. "we use a custom DNS server — what's your final recommendation?"). Field-observed: re-reading `report` in that follow-up turn STALLS or raises `NameError`. **Do NOT re-run the whole diagnostic and do NOT re-provision a cluster to answer a follow-up.**
+Genie Code's serverless session can drop in-memory state between turns — `report`, `ws_ctx`, and even the imported skill functions may be gone when the customer sends a follow-up (e.g. "we use a custom DNS server — what's your final recommendation?"). Re-reading `report` in that follow-up turn can STALL or raise `NameError`. **Do NOT re-run the whole diagnostic and do NOT re-provision a cluster to answer a follow-up.**
 
 Two reset situations, two recoveries:
 - **Reset MID-diagnostic (before finalize):** the chunked checkpoint already has every completed check. Re-run Step 1 and simply re-call the driver (`run_network_doctor(...)` with the same problem text or session_path) — sessions and checkpoints resume from disk; nothing recorded re-runs.
