@@ -228,52 +228,78 @@ any credential — check it against your own sharing rules before attaching it.
 
 A single driver — **`run_network_doctor()`** — is the only entry point. It deterministically classifies the problem (Path A/B/C) **in code**, asks the right intake questions, runs the matching check suite, correlates the results into a ranked diagnosis, and renders an HTML dashboard. The model's role is narrow: relay the driver's questions and present its findings — it never guesses the cause and never makes ad-hoc/direct Azure calls.
 
-```
-         ┌─────────────────────────────────────────────┐
-         │        You describe the problem              │
-         │   (any language; connectivity / storage /    │
-         │    cluster-start)                            │
-         └──────────────────────┬──────────────────────┘
-                                │
-                  ┌─────────────▼──────────────┐
-                  │   run_network_doctor()      │
-                  │   (doctor.py — the driver)  │
-                  │                             │
-                  │ • classifies Path A/B/C     │
-                  │   deterministically in code │
-                  │ • drives conversational     │
-                  │   intake (relayed verbatim) │
-                  │ • owns ALL Azure/ARM I/O    │
-                  └─────────────┬──────────────┘
-                                │
-        ┌───────────────┬───────┴───────┬────────────────┐
-   ┌────▼─────┐  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
-   │ Network  │  │ Azure Infra │  │ Serverless  │  │ Storage /   │
-   │ Probes   │  │ Checks (ARM)│  │ NCC Checks  │  │ Cluster-    │
-   │ (Path A) │  │ NSG/routes/ │  │ attach/PE/  │  │ start (B/C) │
-   │ DNS/TCP/ │  │ peering/PE/ │  │ egress      │  │ firewall/   │
-   │ TLS/...  │  │ DNS zones   │  │             │  │ NSP/NHC/ARM │
-   └────┬─────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-        └───────────────┴───────┬────────┴────────────────┘
-                                │
-         ┌──────────────────────▼──────────────────────┐
-         │          CORRELATION ENGINE                  │
-         │          (correlation_engine.py)             │
-         │                                              │
-         │   32 deterministic rules across A/B/C map    │
-         │   check combinations to a ranked diagnosis   │
-         │   with severity, confidence, and a STABLE    │
-         │   fix order (same evidence → same primary    │
-         │   diagnosis, every run)                      │
-         └──────────────────────┬───────────────────────┘
-                                │
-                    ┌───────────▼───────────┐
-                    │   DiagnosticReport    │
-                    │ • Ranked diagnoses    │
-                    │ • Fix order           │
-                    │ • Summary             │
-                    │ • HTML Dashboard      │
-                    └───────────────────────┘
+```mermaid
+flowchart TD
+    START(["Customer describes the problem<br/>any language · connectivity / storage / cluster-start"]) --> DRIVER
+
+    DRIVER["<b>run_network_doctor()</b> · doctor.py — the only entry point<br/>persists session · asks ONE question at a time, relayed verbatim<br/>classifies Path A/B/C deterministically in code · owns ALL Azure/ARM I/O"]
+
+    DRIVER --> A0
+    DRIVER --> B0
+    DRIVER --> C0
+
+    subgraph PA["🔵 PATH A · Connectivity"]
+        direction TB
+        A0{"Which compute?"}
+        A0 -->|Classic| ACP["Probe on the classic cluster<br/>DNS · TCP · TLS · latency · ping · traceroute"]
+        A0 -->|Serverless| ASP["Probe in the serverless session<br/>DNS · TCP · TLS · latency · ping · traceroute"]
+        ACP --> AVNET["Discover the VNet via ARM<br/>NSG · routes · peering · hub firewall · PE / DNS"]
+        ASP --> ANCC["Inspect serverless<br/>NCC attach · PE rules · rule state · egress policy"]
+    end
+
+    subgraph PB["🟣 PATH B · Storage / UC"]
+        direction TB
+        B0["Trace the UC chain<br/>table → catalog → credential → connector"]
+        B0 --> BNET["Network checks<br/>firewall · public access · private endpoint<br/>NSP · resource rule · forced tunnel"]
+        BNET --> BOPEN{"Network path open?"}
+        BOPEN -->|No| BNETCAUSE["Network is the cause"]
+        BOPEN -->|Yes| BRBAC["Check the RBAC roles"]
+    end
+
+    subgraph PC["🟠 PATH C · Cluster start"]
+        direction TB
+        C0["Parse the failure<br/>X_NHC · SERVICE_FAULT · launch failure"]
+        C0 --> CARM["Read Azure ARM — LIVE via a Reader SP<br/>no offline mode: if ARM is unreachable → guide egress &amp; re-run"]
+        CARM --> CCHK["ARM checks<br/>workspace · VNet / subnets · delegation · NSG rules<br/>routes / NAT · hub firewall · private link · private DNS · control plane"]
+    end
+
+    AVNET --> ENGINE
+    ANCC --> ENGINE
+    BNETCAUSE --> ENGINE
+    BRBAC --> ENGINE
+    CCHK --> ENGINE
+
+    ENGINE["<b>CORRELATION ENGINE</b> · correlation_engine.py<br/>32 deterministic rules across A/B/C · combines evidence<br/>ranks root causes · STABLE fix order · separates network planes"]
+
+    ENGINE --> CONF{"Confirmation<br/>required?"}
+    CONF -->|Yes| ASKC["Ask the customer before any fix"]
+    CONF -->|No| OUT
+    ASKC --> OUT
+    OUT["Root cause · Remediation · Verification"]
+    OUT --> DASH["<b>HTML DASHBOARD</b><br/>checks + evidence · diagnosis + fix order"]
+    DASH --> APPLY["Customer applies the fix"]
+    APPLY --> RV["Re-verify the failed checks"]
+    RV -.->|still failing| DRIVER
+
+    classDef driver fill:#1d4ed8,stroke:#bfdbfe,color:#ffffff
+    classDef pathA fill:#2563eb,stroke:#93c5fd,color:#ffffff
+    classDef pathB fill:#7c3aed,stroke:#c4b5fd,color:#ffffff
+    classDef pathC fill:#c2410c,stroke:#fdba74,color:#ffffff
+    classDef engine fill:#15803d,stroke:#86efac,color:#ffffff
+    classDef out fill:#0f766e,stroke:#5eead4,color:#ffffff
+    classDef term fill:#334155,stroke:#94a3b8,color:#ffffff
+
+    class START,APPLY,RV term
+    class DRIVER driver
+    class A0,ACP,ASP,AVNET,ANCC pathA
+    class B0,BNET,BOPEN,BNETCAUSE,BRBAC pathB
+    class C0,CARM,CCHK pathC
+    class ENGINE engine
+    class CONF,ASKC,OUT,DASH out
+
+    style PA stroke:#2563eb,stroke-width:2px
+    style PB stroke:#7c3aed,stroke-width:2px
+    style PC stroke:#c2410c,stroke-width:2px
 ```
 
 ### Progressive disclosure (the skill layer)
