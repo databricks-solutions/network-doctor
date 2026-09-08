@@ -1,5 +1,36 @@
-*conf*.json
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS / editor
 .DS_Store
-__pycache__
 .idea/
+.vscode/
+
+# Databricks
+.databricks/
+
+# Secrets / local config
+*conf*.json
 .env
+
+# Tooling state — ignore local/transient .claude state, but TRACK any
+# checked-in agents and commands.
+.claude/*
+!.claude/agents/
+!.claude/commands/
+.claude/settings.local.json
+.playwright-mcp/
+
+# Local logs / scratch
+*.log
+.tmp/
+
+# Local tool state
+.isaac/
