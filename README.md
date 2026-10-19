@@ -19,8 +19,8 @@ words, in a chat, in any language. It asks you one question at a time and finish
 report you can hand to whoever owns your Azure network.
 
 **→ [Install it in your workspace](#install-it-in-your-workspace)** — clone this repository
-as a Databricks Git folder, then run one cell to install the skill. About three minutes, no
-CLI, screenshots included.
+as a Databricks Git folder and register it with Genie Code. About three minutes, all in the
+UI, screenshots included.
 
 ### What using it looks like
 
@@ -84,21 +84,14 @@ Root causes are buried across layers — VNets, NSGs, route tables, firewalls, P
 
 ## Install it in your workspace
 
-Network Doctor is a **skill**: a folder that [Genie Code](https://docs.databricks.com/aws/en/genie-code/)
-reads from `/Workspace/Users/<you>/.assistant/skills/`. Installing it takes two steps: you
-clone this repository as a **Databricks Git folder** in your user folder, so updating later
-is a `Pull`, and you run **one notebook cell** that copies the skill into
-`.assistant/skills`. No CLI.
+Network Doctor is a [Genie Code](https://docs.databricks.com/aws/en/genie-code/) **skill**.
+You install it entirely in the UI: clone this repository as a **Databricks Git folder**, then
+register that folder with Genie Code. No CLI, no code, and updating later is a `Pull`.
 
 **About three minutes**, and you can do it yourself if you can open a notebook. You do not
 need to be a workspace admin.
 
-> **Why two steps:** Genie Code does not load a skill whose folder is itself a Git folder.
-> Cloning straight into `.assistant/skills` leaves the skill invisible to Genie Code, so the
-> Git folder lives in your user folder and the install cell puts a plain copy where Genie
-> Code looks.
-
-### 1. Clone this repository as a Git folder in your user folder
+### 1. Clone this repository as a Git folder
 
 In the **Workspace** browser, open your own user folder (**Workspace** → **Users** → you) and
 click **Create** → **Git folder**:
@@ -109,7 +102,7 @@ click **Create** → **Git folder**:
 |---|---|
 | **Git repository URL** | `https://github.com/databricks-solutions/network-doctor.git` |
 | **Git provider** | GitHub |
-| **Git folder name** | `network-doctor` — the install cell looks for exactly this name |
+| **Git folder name** | `network-doctor` |
 
 ![The Create Git folder dialog](docs/images/nd-02-git-folder-dialog.png)
 
@@ -117,53 +110,34 @@ Leave **Sparse checkout mode** off, then **Create Git folder**. The repository i
 no Git credential is needed. If your workspace requires one for GitHub, add it under your
 name, top-right → **Settings** → **Linked accounts** → **Git integration**.
 
-### 2. Install the skill where Genie Code looks
+### 2. Register the Git folder with Genie Code
 
-Open any Python notebook (serverless is fine), paste this cell and run it:
+Open any notebook and click the **sparkle icon**, top-right, to open Genie Code. In its **⋮**
+menu choose **Customizations** → **Skills** → **Add skill**. Enter the path of the Git folder
+from step 1, `/Users/<you>/network-doctor`, or pick it with the folder icon. Then click
+**Add folder**:
 
-```python
-# Network Doctor: install (or update) the skill from your Git folder
-import os, shutil
+![Add skill with the Git folder path, then Add folder](docs/images/nd-03-add-skill-folder.png)
 
-me = spark.sql("SELECT current_user()").first()[0]
-src = f"/Workspace/Users/{me}/network-doctor"                    # the Git folder from step 1
-dst = f"/Workspace/Users/{me}/.assistant/skills/network-doctor"  # where Genie Code looks for skills
+Register the **Git folder itself**. Genie Code looks for skills in the folders inside it, and
+the skill is the `network-doctor/` folder in this repository. It appears in the list right
+away, already enabled:
 
-shutil.rmtree(dst, ignore_errors=True)
-os.makedirs(dst)
-shutil.copyfile(f"{src}/SKILL.md", f"{dst}/SKILL.md")
-for d in ("reference", "scripts"):
-    shutil.copytree(f"{src}/{d}", f"{dst}/{d}", copy_function=shutil.copyfile)
-
-print("Installed:", sorted(os.listdir(dst)))
-```
-
-It prints `Installed: ['SKILL.md', 'reference', 'scripts']`. It creates `.assistant/skills` if
-your workspace does not have it yet, and you end up with an ordinary folder:
-
-```
-/Workspace/Users/<you>/.assistant/skills/network-doctor/
-├── SKILL.md          the instructions Genie Code follows
-├── reference/        four documents it opens as needed
-└── scripts/          twelve Python modules — the diagnostic engine
-```
-
-![The network-doctor folder inside .assistant/skills](docs/images/nd-03-skills-folder.png)
+![network-doctor listed and enabled under Customizations → Skills](docs/images/nd-05-genie-skills.png)
 
 **Nothing else is written anywhere**: no tables, no schemas, no jobs, no clusters at
 install time.
 
 ### 3. Describe your problem — that is the whole interface
 
-Open any Python notebook, click the **sparkle icon** top-right to open Genie Code, and say
-what is wrong, in any language:
+In Genie Code, say what is wrong, in any language:
 
-> "my classic cluster can't reach sql01.corp.internal on port 1433"
+> "I cannot connect to my SQL Server at sql01.corp.internal from a Lakehouse Federation query."
 
-**You do not name the skill, mention a file, or paste a path.** Genie Code finds a skill
-sitting in `.assistant/skills/` by itself:
+**You do not name the skill, mention a file, or paste a path.** Genie Code picks up the skill
+by itself, loads the diagnostic engine and starts the intake:
 
-![Genie Code picking up the skill from the workspace folder and starting the intake](docs/images/nd-04-genie-activates.png)
+![Genie Code picking up the skill and starting the intake](docs/images/nd-04-genie-activates.png)
 
 From there it asks **one question at a time** and finishes with the diagnosis **as text in
 the chat**. That text is the deliverable: the cause, the fix, the checks that failed, and
@@ -177,22 +151,20 @@ Type `@` in the Genie Code prompt and open **Skills**: `network-doctor` must be 
 
 ![network-doctor listed under @ → Skills in the Genie Code prompt](docs/images/nd-06-skill-in-genie.png)
 
-It also shows up under **Genie Code → Customizations → Skills** as a **User** skill, already
-enabled. If its toggle is ever off it will not load, so switch it back on there.
-
-![The network-doctor skill enabled under Genie Code → Customizations → Skills](docs/images/nd-05-genie-skills.png)
+If its toggle under **Customizations** → **Skills** is ever off, it will not load. Switch it
+back on there.
 
 ### Updating, and removing
 
-**Updating** is a `Pull` on the Git folder, then **run the install cell again**. It replaces
-the copy in `.assistant/skills`. Then start a **fresh** Genie Code conversation, because an
-open one keeps the previous instructions. If Genie Code still shows the old version,
-hard-refresh the browser tab.
+**Updating** is a `Pull` on the Git folder. Then start a **fresh** Genie Code conversation,
+because an open one keeps the previous instructions. If Genie Code still shows the old
+version, hard-refresh the browser tab.
 
-**Removing** it is deleting `.assistant/skills/network-doctor` and the Git folder. There is
-nothing else to undo: no tables, no schemas, no jobs, and no cluster to clean up, because
-Network Doctor never creates compute. Reports you asked it to save stay in
-`network_doctor_reports/` until you delete them.
+**Removing** it is two clicks: remove the folder under **Customizations** → **Skills** →
+**Extra skill folders**, then delete the Git folder. There is nothing else to undo: no
+tables, no schemas, no jobs, and no cluster to clean up, because Network Doctor never creates
+compute. Reports you asked it to save stay in `network_doctor_reports/` until you delete
+them.
 
 ---
 
@@ -201,9 +173,8 @@ Network Doctor never creates compute. Reports you asked it to save stay in
 | What you see | Why | What to do |
 |---|---|---|
 | No sparkle icon in the notebook | Genie Code isn't enabled for this workspace | Ask your workspace administrator to enable it |
-| It answers with "possible causes" instead of asking you a question | Genie Code did not load the skill | Type `@` → **Skills**. If `network-doctor` is not listed, run the install cell (step 2). `.assistant/skills/network-doctor` must be an ordinary folder: a Git folder cloned there is ignored by Genie Code. Then hard-refresh the tab and start a new conversation |
-| The install cell fails with `FileNotFoundError` | The Git folder is not at `/Workspace/Users/<you>/network-doctor` | Name the Git folder exactly `network-doctor` and create it in your user folder (step 1) |
-| It says it can't load the diagnostic scripts | `scripts/` is missing from the installed copy, or the conversation predates the install | Run the install cell again, then start a new conversation |
+| It answers with "possible causes" instead of asking you a question | Genie Code did not load the skill | Open **Customizations** → **Skills**: `network-doctor` must be listed and on. If it is not, register the Git folder itself (step 2), not the `network-doctor/` folder inside it. Do not clone into `.assistant/skills`: Genie Code does not load a Git folder from there. Then start a new conversation |
+| It says it can't load the diagnostic scripts | The Git folder is on an old version, or the conversation predates the install | `Pull` the Git folder, then start a new conversation |
 
 ---
 
@@ -346,9 +317,8 @@ Network is checked **before** RBAC — if there is no network path, role assignm
 
 - **Azure Databricks workspace**, with **Genie Code** available (the sparkle icon in a
   notebook). If you do not have that icon, there is nothing for the skill to run in.
-- **Permission to create a Git folder** in your own workspace user folder, and to run one
-  notebook cell that writes into your own `.assistant/skills`. That is ordinary
-  workspace-user access, not admin.
+- **Permission to create a Git folder** in your own workspace user folder, which is
+  ordinary workspace-user access, not admin.
 - **A classic cluster you start** (for classic-compute Path A diagnostics). The probes must
   run from inside the workspace VNet, so they run on a cluster you provide — the tool asks for
   its id and **never creates, starts, stops or deletes compute**. A single-node cluster with a
@@ -392,33 +362,34 @@ admin only for the optional serverless NCC checks.
 **Data residency.** No data leaves your workspace and your Azure tenant. All Azure and
 Databricks API calls appear in your own audit logs.
 
-**Uninstall.** Delete `.assistant/skills/network-doctor` and the Git folder. See [Updating, and removing](#updating-and-removing).
+**Uninstall.** Remove the folder under Customizations → Skills, then delete the Git folder. See [Updating, and removing](#updating-and-removing).
 
 ---
 
 ## Project structure
 
 ```
-├── SKILL.md                        # slim always-loaded core — the skill Genie Code reads
+├── network-doctor/                 # the skill Genie Code loads (register the repo's Git folder)
+│   ├── SKILL.md                    # slim always-loaded core
+│   ├── reference/                  # progressive disclosure — opened on demand
+│   │   ├── PATH_A_connectivity.md
+│   │   ├── PATH_B_storage.md
+│   │   ├── PATH_C_cluster_start.md
+│   │   └── DIAGNOSTIC_MACHINERY.md
+│   └── scripts/                    # the deterministic diagnostic engine
+│       ├── doctor.py               # run_network_doctor() — the single driver
+│       ├── orchestrator.py         # DAG-based check execution
+│       ├── correlation_engine.py   # 32 deterministic diagnosis rules
+│       ├── models.py               # Status, CheckResult, Severity, Diagnosis
+│       ├── secret_utils.py         # Databricks Secrets helpers for Azure SP
+│       ├── classic_probers.py      # DNS, TCP, TLS, traceroute, latency, ping
+│       ├── azure_infra_checks.py   # NSG, routes, peering, PE, DNS zones (ARM)
+│       ├── serverless_ncc_checks.py # NCC attach / PE rules / egress
+│       ├── storage_access_checks.py # storage firewall, NSP, credential chain
+│       ├── cluster_start_checks.py # NHC parsing + subnet/NSG/route ARM checks
+│       ├── topology.py             # the network graph the diagnosis runs against
+│       └── report_builder.py       # HTML dashboard generation
 ├── .assistant_instructions.md      # optional workspace-wide Genie Code preferences
-├── reference/                      # progressive disclosure — opened on demand
-│   ├── PATH_A_connectivity.md
-│   ├── PATH_B_storage.md
-│   ├── PATH_C_cluster_start.md
-│   └── DIAGNOSTIC_MACHINERY.md
-├── scripts/                        # the deterministic diagnostic engine
-│   ├── doctor.py                   # run_network_doctor() — the single driver
-│   ├── orchestrator.py             # DAG-based check execution
-│   ├── correlation_engine.py       # 32 deterministic diagnosis rules
-│   ├── models.py                   # Status, CheckResult, Severity, Diagnosis
-│   ├── secret_utils.py             # Databricks Secrets helpers for Azure SP
-│   ├── classic_probers.py          # DNS, TCP, TLS, traceroute, latency, ping
-│   ├── azure_infra_checks.py       # NSG, routes, peering, PE, DNS zones (ARM)
-│   ├── serverless_ncc_checks.py    # NCC attach / PE rules / egress
-│   ├── storage_access_checks.py    # storage firewall, NSP, credential chain
-│   ├── cluster_start_checks.py     # NHC parsing + subnet/NSG/route ARM checks
-│   ├── topology.py                 # the network graph the diagnosis runs against
-│   └── report_builder.py           # HTML dashboard generation
 ├── README.md                       # this file — what it is, and how to install it
 ├── CHANGELOG.md                    # the version in every report's footer
 ├── LICENSE.md

@@ -74,9 +74,7 @@ If `ws_ctx['is_serverless']` is True and `compute_type` includes "classic", the 
 ```python
 import json
 
-_user = spark.sql("SELECT current_user()").collect()[0][0]
-_skill_dir = f"/Workspace/Users/{_user}/.assistant/skills/network-doctor/scripts"
-
+# `_skill_dir` is the scripts folder Step 1 resolved (re-run Step 1 if the session reset).
 # Classic clusters mount /Workspace via FUSE, so the remote cluster imports the
 # same modules directly — no source inlining needed.
 probe_code = f"""

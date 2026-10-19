@@ -8,6 +8,7 @@ inserted by SKILL.md Step 1). Also works exec-loaded for back-compat.
 """
 
 import json
+import os
 import time
 
 from models import (
@@ -527,19 +528,23 @@ _REMOTE_PROBE_CACHE = "_remote_probe_results"
 _REMOTE_PROBE_FAILED = "_remote_probe_error"
 
 
+# This module's own folder. The skill can be installed anywhere in the workspace (the
+# README registers a Git folder; older installs copied it into .assistant/skills), and a
+# classic cluster mounts /Workspace via FUSE at the same path, so this is the one path
+# that is right on both sides.
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def _remote_probe_code(host, port, compute_type, private_link_capable):
     """The snippet executed ON the customer's cluster. Returns JSON on stdout.
 
-    It resolves the skill's script directory ON THE CLUSTER, the same way the Step 1
-    loader does, rather than being handed a path: this session cannot name the workspace
-    user (get_workspace_context does not return one), and a wrong path here fails the
-    import silently on the far side.
+    It imports the probes from this module's own folder (`_SCRIPTS_DIR`) rather than
+    rebuilding a path from the workspace user: the install location is not fixed, and a
+    wrong path here fails the import silently on the far side.
     """
     return (
         "import json, sys\n"
-        "_u = spark.sql('SELECT current_user()').collect()[0][0]\n"
-        "sys.path.insert(0, '/Workspace/Users/' + _u + "
-        "'/.assistant/skills/network-doctor/scripts')\n"
+        f"sys.path.insert(0, {_SCRIPTS_DIR!r})\n"
         "from classic_probers import (check_dns, check_tcp, check_tls, check_ping,\n"
         "                            check_traceroute, check_latency,\n"
         "                            check_local_dns_override)\n"

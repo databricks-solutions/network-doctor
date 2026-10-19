@@ -7,13 +7,14 @@ Quote it if you need help with a result.
 
 ### Fixed
 
-- **Installation now works as documented.** Genie Code does not load a skill whose folder is
-  itself a Git folder, so a clone straight into `.assistant/skills` left Network Doctor
-  invisible: Genie answered with generic "possible causes" instead of running the diagnosis.
-  The README now clones the Git folder into your user folder and installs the skill into
-  `.assistant/skills/network-doctor` with one notebook cell. Updating is a `Pull` plus
-  re-running that cell. If you installed with the old steps, delete the Git folder inside
-  `.assistant/skills` and follow the new ones.
+- **Installation now works as documented, entirely in the UI.** Genie Code loads a skill
+  from a subfolder of a registered skills folder. With `SKILL.md` at the repository root, a
+  Git folder clone was never loaded, and Genie answered with generic "possible causes"
+  instead of running the diagnosis. The skill now lives in `network-doctor/` inside the
+  repository. You clone the repository as a Git folder and register that folder under
+  Genie Code → Customizations → Skills → Add skill. Updating is a `Pull`. If you installed
+  with the old steps, delete the Git folder you cloned into `.assistant/skills` and follow
+  the README again.
 
 ## 1.1.0 — 2026-09-07
 

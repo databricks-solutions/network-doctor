@@ -178,12 +178,25 @@ This skill runs *inside* the customer's notebook session — the model executes 
 Before running any diagnostics, load the scripts. Determine your username and run this in a code cell:
 
 ```python
+import glob
+import os
 import sys
 import importlib
 
 # Determine the current user
 _user = spark.sql("SELECT current_user()").collect()[0][0]
-_skill_dir = f"/Workspace/Users/{_user}/.assistant/skills/network-doctor/scripts"
+_home = f"/Workspace/Users/{_user}"
+# The skill is the `network-doctor/` folder inside the Git folder the customer registered
+# under Genie Code -> Customizations -> Skills (README default: <home>/network-doctor), or
+# a plain copy in .assistant/skills. Take the first candidate that holds the engine.
+_candidates = ([f"{_home}/network-doctor/network-doctor",
+                f"{_home}/.assistant/skills/network-doctor",
+                "/Workspace/.assistant/skills/network-doctor"]
+               + sorted(glob.glob(f"{_home}/*/network-doctor"))
+               + sorted(glob.glob(f"{_home}/*/*/network-doctor")))
+_skill_dir = next((f"{_c}/scripts" for _c in _candidates
+                   if os.path.isfile(f"{_c}/scripts/doctor.py")),
+                  f"{_home}/network-doctor/network-doctor/scripts")
 if _skill_dir not in sys.path:
     sys.path.insert(0, _skill_dir)
 
