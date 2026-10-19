@@ -15,6 +15,14 @@ Quote it if you need help with a result.
   Genie Code → Customizations → Skills → Add skill. Updating is a `Pull`. If you installed
   with the old steps, delete the Git folder you cloned into `.assistant/skills` and follow
   the README again.
+- **A storage error on a table now runs the storage diagnosis.** When a query such as
+  `SELECT * FROM catalog.schema.table` failed on serverless with the error Databricks reports
+  for a rejected storage read (`cloud: adlgen2 … statusCode: 403, statusMessage: Forbidden`),
+  the tool treated the table name as a network host. It probed it as one and never looked at
+  the storage account. The table is now recognised, resolved to its storage account, and the
+  storage firewall, network perimeter and Access Connector rules are checked.
+- **You confirm the compute.** The question "serverless or classic?" is always put to you,
+  even when your message already names one, because it decides where every probe runs.
 
 ## 1.1.0 — 2026-09-07
 

@@ -99,6 +99,9 @@ _STORAGE_CONTEXT_SIGNS = (
     "schema", "table", "tabela",
     # What customers actually call ADLS in their own words.
     "data lake", "datalake", "lakehouse",
+    # How Databricks itself names ADLS Gen2 in a storage error it surfaces from serverless
+    # ("/data: Request failed, cloud: adlgen2, operation: list, statusCode: 403").
+    "adlgen2", "adls gen2", "adlsgen2",
 )
 
 _HOST_RE = _re.compile(
@@ -110,6 +113,25 @@ _PORT_RE = _re.compile(r"\bport(?:a)?\s+(\d{2,5})\b", _re.IGNORECASE)
 # auto-extract that form; a bare `a.b.c` could be a hostname (e.g. the storage
 # FQDN), so for bare names we ask in intake instead of guessing.
 _UC_TABLE_RE = _re.compile(r"`([A-Za-z0-9_-]+)`\.`([A-Za-z0-9_-]+)`\.`([A-Za-z0-9_-]+)`")
+# A bare `a.b.c` IS a table when a SQL keyword that introduces one sits right before it
+# (FROM / JOIN / INTO / UPDATE / TABLE). Without this, "SELECT * FROM cat.sch.tbl fails on
+# serverless ... 403" routed to Path A and probed `cat.sch.tbl:443` as if it were a host.
+# The lookahead rejects a longer dotted name, so `from acct.dfs.core.windows.net` stays a host.
+_UC_SQL_TABLE_RE = _re.compile(
+    r"\b(?:from|join|into|update|table)\s+`?([A-Za-z0-9_-]+)`?\.`?([A-Za-z0-9_-]+)`?"
+    r"\.`?([A-Za-z0-9_-]+)`?(?![\w.-])",
+    _re.IGNORECASE,
+)
+
+
+def _uc_table_from_text(problem_text):
+    """The Unity Catalog table the customer named (`cat.schema.table`), or "".
+
+    Backticked anywhere, or bare right after a SQL table keyword.
+    """
+    text = problem_text or ""
+    m = _UC_TABLE_RE.search(text) or _UC_SQL_TABLE_RE.search(text)
+    return ".".join(m.groups()) if m else ""
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +318,7 @@ def _looks_like_storage_access_problem(problem_text):
     has_strong_storage_error = any(sig in low for sig in _STORAGE_STRONG_SIGNS)
     has_decisive_storage_error = any(sig in low for sig in _STORAGE_DECISIVE_SIGNS)
     has_uc_table = bool(_UC_TABLE_RE.search(problem_text or ""))
+    has_sql_table = bool(_UC_SQL_TABLE_RE.search(problem_text or ""))
     has_compute_asymmetry = (
         "serverless" in low and "classic" in low
         and any(sig in low for sig in ("falha", "falhando", "fail", "fails", "funciona", "works"))
@@ -311,15 +334,23 @@ def _looks_like_storage_access_problem(problem_text):
         # _extract_target won't grab it). Presenting it as "the failing query" IS a
         # storage/UC-access signal, even without permission/storage keywords (T3).
         or has_uc_table
+        # A table named in the failing SQL plus an access-denied signal (403 / Forbidden /
+        # not authorized) is a storage/UC-access failure. Alone, a SQL table is not enough:
+        # a Lakehouse Federation query that times out is still Path A connectivity.
+        or (has_sql_table and (has_access or has_strong_storage_error))
         or (has_compute_asymmetry and has_storage_context and has_access)
     )
 
 def _extract_target(problem_text):
     host, port = "", 0
+    table = _uc_table_from_text(problem_text).lower()
     for m in _HOST_RE.finditer(problem_text or ""):
         cand = m.group(1)
         # skip obvious non-targets that show up in error pastes
         if cand.lower().endswith((".html", ".json", ".py")):
+            continue
+        # a Unity Catalog table is not a network host, whatever _HOST_RE thinks
+        if table and cand.lower() == table:
             continue
         host, port = cand, int(m.group(2) or 0)
         break
@@ -3131,6 +3162,14 @@ def _emit_need_input(s, path):
     for q in qs:
         print(f"[Doctor]   - {q['question']}")
     ids = sorted({i for q in qs for i in q["ids"]})
+    if "compute_type" in ids:
+        # The relay has answered this one itself from the problem text ("you already
+        # mentioned serverless - I'll pass that through"), so the customer never confirmed
+        # the plane the whole diagnosis then ran on. The plane decides where probes run.
+        print("[Doctor] The compute question goes to the CUSTOMER even if their message already "
+              "names a compute — they confirm it. Never fill compute_type yourself.")
+        res["relay_rule"] = ("ask the customer to confirm compute_type; never infer it from "
+                             "the problem text")
     # Surface-minimization: pass ONLY sp_scope (key names default), and build the
     # answers dict in a prior neutral cell rather than inlining credential-shaped
     # keys next to an external host:port (that combination over-triggers the gate).
@@ -4119,9 +4158,9 @@ def _drive_network_doctor(problem_text="", answers=None, session_path="", base_d
             if s["path"] == "C":
                 s["answers"]["nhc_error_text"] = "present"
             if s["path"] == "B":
-                m = _UC_TABLE_RE.search(problem_text or "")
-                if m:
-                    s["answers"]["full_table"] = ".".join(m.groups())
+                _tbl = _uc_table_from_text(problem_text)
+                if _tbl:
+                    s["answers"]["full_table"] = _tbl
                 # the failing storage host is very often already in the customer's
                 # first message ("...cannot read abfss://...@<acct>.dfs.core.windows.net/...").
                 # Reading it here means one fewer question, and it is the fallback target
