@@ -23,6 +23,12 @@ Quote it if you need help with a result.
   storage firewall, network perimeter and Access Connector rules are checked.
 - **You confirm the compute.** The question "serverless or classic?" is always put to you,
   even when your message already names one, because it decides where every probe runs.
+- **A serverless egress answer is what did not get through, and where.** When serverless
+  cannot reach a destination, the chat says which network policy attached to your workspace
+  does not allow it and where that list is in the Account Console, and nothing else: no
+  other destination to allow, no advice on how to set the policy. When your Databricks
+  account could not be read, the chat says so in one line with the path of the read-only
+  script an account admin can run. The full options are in the dashboard.
 
 ## 1.1.0 — 2026-09-07
 

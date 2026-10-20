@@ -2263,6 +2263,69 @@ def _first_sentence(text, max_words=32):
     return sents[0] if len(words) <= max_words else " ".join(words[:max_words]) + "…"
 
 
+_HANDOFF_REASON = {
+    "unauthorized": "the service principal is not a Databricks account admin",
+    "credentials": "the account API rejected the service principal's credentials",
+    "unreachable": "accounts.azuredatabricks.net is not reachable from this compute",
+    "no_credentials": "no account credentials were given",
+}
+
+
+def _handoff_line(c):
+    """The account-layer hand-off as one chat line; the full options are in the dashboard."""
+    md = getattr(c, "metadata", None) or {}
+    reason = _HANDOFF_REASON.get(md.get("account_blind_kind"), "the account API could not be read")
+    script = (md.get("account_script_path") or "").strip()
+    how = (f"An existing account admin can run the read-only script `{script}` (five GETs, "
+           "changes nothing); the other options are in the dashboard." if script
+           else "How to close it is in the dashboard.")
+    return f"**Closing the gap** — I could not read your Databricks account: {reason}. {how}"
+
+
+# The serverless egress layer: the customer asked whether serverless reaches a destination,
+# and the answer is what did not get through and where that is decided — nothing more.
+# Seen live on a pypi.org run: around that answer the general layout added the check counts,
+# eight downstream probes that could not run once DNS had failed, and a re-verify footer, and
+# the customer's verdict was that it was still far too long. Every row, the limits and the
+# hand-off options are in the dashboard.
+_SERVERLESS_EGRESS_PATTERNS = ("egress_policy_blocks", "serverless_egress_ncc")
+
+
+def _serverless_egress_chat(report):
+    """The whole chat when the one blocking cause is the serverless egress layer, else ""."""
+    checks = report_rows(report)
+    ranked = rank_diagnoses(report.diagnoses)
+    causes = [d for d in ranked if severity_value(d) in ("critical", "high")]
+    if len(causes) != 1 or getattr(causes[0], "pattern_id", "") not in _SERVERLESS_EGRESS_PATTERNS:
+        return ""
+    # A warning that still needs an action is a second thing to say; leave that to the
+    # general layout rather than drop it.
+    if any(status_value(c) not in ("pass", "skip", "fail", "error")
+           and not _is_inconclusive(c) and not _no_action_row(c) for c in checks.values()):
+        return ""
+    d = causes[0]
+    counts = check_verdict_counts(checks)
+    overall = str(getattr(report.overall_status, "value", report.overall_status) or "fail").lower()
+    banner, _ = headline_words("fail" if overall == "error" else overall, counts)
+    title = (getattr(d, "title", "") or "").strip()
+    sev = severity_value(d).upper()
+    steps = [str(p).strip() for p in (d.prescription or []) if str(p).strip()]
+    parts = [f"**Overall: {banner}** — target `{report.target}`",
+             f"**Root cause — {title}** ({sev}) — {_first_sentence(getattr(d, 'root_cause', ''))}"]
+    if steps:
+        parts.append("**Where** — " + steps[0] if len(steps) == 1
+                     else "**Where** —\n" + "\n".join(f"- {p}" for p in steps))
+    _handoffs = [c for c in checks.values()
+                 if (getattr(c, "metadata", None) or {}).get(_HANDOFF_META)
+                 and (getattr(c, "recommendation", "") or "").strip()]
+    if _handoffs:
+        parts.append(_handoff_line(_handoffs[0]))
+    text = "\n\n".join(parts)
+    for problem in _summary_audit(text, report):
+        print(f"[Doctor] WARNING — chat-summary self-check: {problem}")
+    return text
+
+
 def _chat_summary(report):
     """Objective customer-facing chat message; the exhaustive detail lives in the dashboard.
 
@@ -2275,7 +2338,11 @@ def _chat_summary(report):
         why; if nothing is that severe, the single top-ranked finding,
       - the actionable warning rows named (not merely counted),
       - a pointer to the dashboard for the rest.
+    A serverless egress cause gets the shorter `_serverless_egress_chat` instead.
     """
+    compact = _serverless_egress_chat(report)
+    if compact:
+        return compact
     checks = report_rows(report)
     counts = check_verdict_counts(checks)
     overall = str(getattr(report.overall_status, "value", report.overall_status) or "pass").lower()
@@ -2350,18 +2417,17 @@ def _chat_summary(report):
                 _blk.append("\n".join("- " + x for x in _fix))
             parts.append("\n".join(_blk))
 
-    # A hand-off is an ACTION, not detail — the account admin runs a read-only snapshot
-    # that needs no new grant. It stays in the chat in full (same as _chat_prescription),
-    # because dropping it leaves the customer with a description of their blindness and
-    # nothing to do about it.
+    # A hand-off is an ACTION, so the chat names it — in ONE line: why the account was
+    # not read, and the script an existing account admin can run. Its options, what the
+    # script collects and how to resume are in the dashboard (report_builder renders the
+    # row's full recommendation). Seen live on a serverless pypi.org run: the full
+    # ~250-word hand-off sat between the cause and the end of the message, and the
+    # customer's verdict was that the answer was buried in it.
     _handoffs = [(k, c) for k, c in checks.items()
                  if (getattr(c, "metadata", None) or {}).get(_HANDOFF_META)
                  and (getattr(c, "recommendation", "") or "").strip()]
     if _handoffs:
-        _blocks = [f"*{_check_label(k, c)}*\n" + (c.recommendation or "").strip()
-                   for k, c in _handoffs]
-        parts.append("**Closing the gap — no new permission required**\n\n"
-                     + "\n\n".join(_blocks))
+        parts.append(_handoff_line(_handoffs[0][1]))
 
     # Everything else — every row, each finding's full reasoning, the limits and the
     # benign observations — is in the dashboard. State the deferred counts honestly.
@@ -2427,14 +2493,15 @@ def _summary_word_budget(report):
                    and (getattr(c, "recommendation", "") or "").strip())
     # Measured across the captured corpus, not chosen: a healthy baseline runs ~114 words
     # (base), a single cause adds a title + one-line why + a COMPLETE multi-step fix (up to
-    # ~160 on the blackhole route remediation), a named warning ~12, and a hand-off is a
-    # full procedure (275, the same measured constant the guide uses). The budget must fit
-    # the longest legitimate fix — it guards against a regression that balloons the summary,
-    # it must never be a cap that forces truncating an instruction.
+    # ~160 on the blackhole route remediation), a named warning ~12, and the hand-off is
+    # one line (~40 with the script path; its full procedure is in the dashboard, and it
+    # is rendered once however many rows carry it). The budget must fit the longest
+    # legitimate fix — it guards against a regression that balloons the summary, it must
+    # never be a cap that forces truncating an instruction.
     return (120                                  # verdict, target, counts, deferred line, verification
             + 160 * len(causes)                  # title + one-line why + a complete fix
             + 12 * warn_action                   # one named warning
-            + _GUIDE_BUDGET_PER_HANDOFF * handoffs)
+            + 45 * min(handoffs, 1))             # the one-line hand-off
 
 
 def _summary_audit(text, report):
@@ -2819,22 +2886,13 @@ def _dashboard_pointer(html_path, handed_off=False):
     if not html_path:
         # The save failed and we cannot see the notebook: there is nothing to point at.
         return ("I could not write the dashboard file to the workspace (the error is in the "
-                "cell output above). The full findings are in the message above this line. "
-                "Tell me if you want to re-verify after applying the fix.")
-    line = ("The diagnosis above is the complete answer — you do not need the dashboard to "
-            f"act on it. **For the per-check detail there is also a saved report** — `{html_path}`")
-    if handed_off:
-        # The recorded signal is narrow, so the sentence is too: our HTML reached a
-        # displayHTML call in a notebook cell in this session. Whether it PAINTED, and
-        # whether Genie later clobbered the cell, are still unobservable from here — hence
-        # "should also appear", not "is displayed".
-        line += (". The same dashboard was handed to a `displayHTML` cell in this session, so it "
-                 "should also appear in that cell's output; open the saved file if it does not.")
-    else:
-        line += (" — open that file for the per-check detail and the evidence behind each "
-                 "finding. It may also be displayed inline in a notebook cell; if you do not "
-                 "see it there, the saved file is the same dashboard.")
-    return line + " Tell me if you want to re-verify after applying the fix."
+                "cell output above). The full findings are in the message above this line.")
+    # One sentence. Seen live on a serverless pypi.org run: the close used to be three —
+    # complete answer, saved report, the displayHTML hand-off — plus a re-verify offer, a
+    # fifth of the whole message. `handed_off` no longer changes the words: the only claim
+    # worth making is the path of a file this process wrote, and saying the dashboard
+    # "should also appear" in a cell is a claim about a notebook nobody here can see.
+    return f"You do not need the dashboard to act on this; the per-check detail is in `{html_path}`."
 
 
 def _displayhtml():
@@ -2987,15 +3045,13 @@ def _present(s, path, report):
         # block ~350 words after the first, whose only new content the reader had to cross
         # the wall of Python to reach. The prescription is already in
         # `chat_prescription`, VERBATIM and in the right place. So this now forbids both.
+        # It then asked for one extra "the script is saved at …" line; the 'Closing the
+        # gap' line now carries the path itself, so that line would only repeat it.
         print("[Doctor]   1c. The ACCOUNT half was NOT read. `chat_prescription` ALREADY "
-              "contains the complete hand-off under 'Closing the gap' — do NOT restate it, "
-              "do NOT summarise it, and do NOT write a second hand-off paragraph. Do NOT "
-              "paste the script: it is a file, and its path is already quoted inside that "
-              "section. Add ONE line and nothing more, so the customer can forward it: "
-              f"\"The read-only account-snapshot script is saved at {_acct_path} — send that "
-              "file to an existing Databricks account admin; it makes five read-only GETs, "
-              "collects network configuration metadata only (no credentials, no data), and "
-              "changes nothing.\" Never claim an NCC is or is not attached.")
+              "names the read-only script and its path in the one 'Closing the gap' line — "
+              "do NOT restate it, do NOT expand it into the options (they are in the "
+              "dashboard), do NOT paste the script and do NOT add a line about it. Never "
+              "claim an NCC is or is not attached.")
     if html_path:
         print(f"[Doctor]   2. NEW cell: displayHTML(nd_render_dashboard(r'{path}'))")
     # do not let the closing line be improvised. It was improvising a claim that the

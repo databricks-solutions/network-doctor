@@ -353,6 +353,12 @@ SKIP_KINDS = (SKIP_NOT_APPLICABLE, SKIP_NOT_NEEDED, SKIP_UNVERIFIED)
 # Metadata key carrying the class on a materialised skip row.
 SKIP_KIND_META = "skip_kind"
 
+# Metadata flag: this row carries an ACTIONABLE hand-off (a read-only snapshot script
+# plus who can run it), not merely a description of the gap. A gap with an action
+# attached must show the action — the limits block prints messages only, so the chat
+# (one line) and the dashboard (the full options) key on this instead.
+ACCOUNT_HANDOFF_META = "account_handoff"
+
 
 class SkipReason(str):
     """A gate's skip reason that also carries WHY the check did not run.
@@ -517,44 +523,6 @@ def is_data_plane_vnet(context):
     return str((context or {}).get("compute_type", "classic")).lower() != "serverless"
 
 
-# ---------------------------------------------------------------------------
-# Companion egress hosts
-# ---------------------------------------------------------------------------
-# Some services answer on one hostname and serve their PAYLOAD from a second one.
-# Allow-listing only the host the customer named leaves the job still broken in a
-# confusing way: the index responds, metadata resolves, and then the download is
-# refused. `%pip install` is the canonical case — pypi.org serves the index, but the
-# wheels come from files.pythonhosted.org.
-#
-# In the field: the engine's prescription named only pypi.org. The CDN was mentioned
-# by the CONVERSATIONAL layer, which volunteered it unprompted — so a customer who
-# followed the engine's fix literally could have allow-listed one host and still failed,
-# and nothing in the product would have caught it.
-#
-# Exact-host keys only. These are "commonly required alongside", not "always required":
-# the prescription says so rather than asserting a certainty we have not measured.
-COMPANION_EGRESS_HOSTS = {
-    "pypi.org":            ("files.pythonhosted.org",),
-    "pypi.python.org":     ("files.pythonhosted.org",),
-    "files.pythonhosted.org": ("pypi.org",),
-    "cran.r-project.org":  ("cloud.r-project.org",),
-    "cloud.r-project.org": ("cran.r-project.org",),
-    "repo1.maven.org":     ("repo.maven.apache.org",),
-    "repo.maven.apache.org": ("repo1.maven.org",),
-    "conda.anaconda.org":  ("repo.anaconda.com",),
-    "repo.anaconda.com":   ("conda.anaconda.org",),
-}
-
-
-def companion_egress_hosts(host):
-    """Hosts usually needed ALONGSIDE `host` for the workload to actually succeed.
-
-    Returns a tuple (possibly empty). Empty is the common case and callers must render
-    nothing extra for it — never invent a companion for an unknown host.
-    """
-    return COMPANION_EGRESS_HOSTS.get(str(host or "").strip().lower(), ())
-
-
 # The DECLARED plane and the MEASURED plane are different facts, and conflating them
 # produced a CRITICAL false positive (in the field).
 #
@@ -610,17 +578,6 @@ def probes_measured_data_plane_vnet(context):
         return True, ""
     return False, PROBE_PLANE_UNKNOWN_SKIP
 
-
-
-def companion_egress_clause(host):
-    """One sentence to append to an allow-list prescription, or "" when there is none."""
-    extra = companion_egress_hosts(host)
-    if not extra:
-        return ""
-    names = ", ".join(f"`{h}`" for h in extra)
-    return (f"Add {names} in the same pass — {host} serves the index, but the payload is "
-            f"served from {'that host' if len(extra) == 1 else 'those hosts'}, so "
-            f"allow-listing {host} alone typically leaves the download still blocked.")
 
 
 def classic_plane_skip(check_name, context):

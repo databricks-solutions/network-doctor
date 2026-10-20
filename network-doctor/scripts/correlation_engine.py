@@ -10,7 +10,6 @@ inserted by SKILL.md Step 1). Also works exec-loaded for back-compat.
 import re as _re
 
 from models import (SKIP_UNVERIFIED, Diagnosis, Severity, Status, actionable_diagnoses,
-                    companion_egress_clause,
                     check_verdict_counts, gate_skip_title, is_data_plane_vnet,
                     severity_value, skip_kind, status_value)
 
@@ -839,23 +838,37 @@ def _rule_serverless_egress_ncc(checks, context=None):
         # never turn `not PASS` into "no NCC attached" — absence requires the explicit
         # readable FAIL emitted by `check_ncc_attached`, which is handled by
         # `_rule_ncc_missing` before this fallback rule.
-        root += (
-            " The Databricks account layer is UNKNOWN / NOT READ in this run. This is "
-            "not evidence that an NCC is absent, that its private-endpoint rule is "
-            "missing, or that the Network policy allows or blocks this destination."
-        )
-        prescription = [
-            "Do not create, attach or change an NCC from this result: the account state "
-            "was not read.",
-            "Use the preferred read-only account-snapshot hand-off in the account-layer "
-            "NOT READ row: an existing Databricks account admin runs the generated "
-            "five-GET script, which changes nothing and uploads account_dump.json.",
-            "Then provide that snapshot path in a fresh notebook so the Doctor can finish "
-            "the account-layer diagnosis without repeating the probes.",
-        ]
+        #
+        # Short on purpose: the governing layer IS known, so the customer gets that and
+        # where to look, nothing more. How to make the account readable is the hand-off
+        # row's job (one line in the chat, the full options in the dashboard) — it used
+        # to be restated here as three steps about the snapshot, and the chat that carried
+        # both read as a procedure manual instead of an answer.
+        if target_private:
+            root = (
+                f"Serverless compute cannot reach {host}, a private-linked target; on serverless "
+                f"that is decided by the NCC private-endpoint rules and the network policy "
+                f"attached to this workspace, which I could not read."
+            )
+            prescription = [
+                "Account Console > Cloud resources > Network Connectivity Configurations > the "
+                f"NCC attached to this workspace > Private endpoint rules (a rule for {host}'s "
+                "resource), and Security > Context based ingress and egress > the network "
+                "policy attached to this workspace > Egress rules.",
+            ]
+        else:
+            root = (
+                f"Serverless compute cannot reach {host}; on serverless that is decided by the "
+                f"network policy attached to this workspace, which I could not read."
+            )
+            prescription = [
+                "Account Console > Security > Context based ingress and egress > the network "
+                "policy attached to this workspace > Egress rules > Allowed domains.",
+            ]
         return Diagnosis(
             pattern_id="serverless_egress_ncc",
-            title="Serverless Egress — Account Network State Not Read",
+            title=("Serverless Egress — NCC and Network Policy Not Read" if target_private
+                   else "Serverless Egress — Network Policy Not Read"),
             severity=Severity.HIGH,
             confidence="medium",
             root_cause=root,
@@ -1281,51 +1294,35 @@ def _rule_egress_policy_blocks(checks):
     md = ep.metadata or {}
     policy_id = md.get("network_policy_id", "?")
     kind = md.get("target_kind", "")
+    # The answer is what did not get through and where that is decided — nothing more.
+    # Seen live on a pypi.org run, twice: first the enforcement-mode detail led the sentence
+    # and pushed the destination out of the chat; then the fix carried advice the customer
+    # had not asked for (a second host to allow, "leave Network access on Restricted"), and
+    # the verdict was that the product must not tell a customer to open anything beyond
+    # what they asked about. Naming WHERE the allow-list lives is enough: whether to change
+    # it is the customer's call.
     if kind == "azure_storage":
         missing = (
             f"{md.get('target_storage_account','?')}/{md.get('target_storage_service','?')}"
         )
-        cause = (
-            f"Serverless egress is blocked by the account Network policy '{policy_id}' "
-            f"(Network access = 'Restricted access to specific destinations', Policy enforcement mode "
-            f"= 'Enforced'). The storage destination '{missing}' is not in the policy's Egress rules "
-            f"(Allowed storage destinations), so serverless cannot reach it."
-        )
-        add_step = (
-            "Egress rules > storage destinations > Add destination > add the missing storage account "
-            f"+ service ({missing})."
-        )
+        cause = (f"The network policy '{policy_id}' attached to this workspace does not allow "
+                 f"the storage destination '{missing}', so serverless compute cannot reach it.")
+        where = "Egress rules > storage destinations"
     else:
-        cause = (
-            f"Serverless egress is blocked by the account Network policy '{policy_id}' "
-            f"(Network access = 'Restricted access to specific destinations', Policy enforcement mode "
-            f"= 'Enforced'). The target's DNS name is not covered by any entry in the policy's Egress "
-            f"rules (Allowed internet destinations), so serverless cannot reach it."
-        )
-        _companion = companion_egress_clause(md.get("target_host", ""))
-        add_step = (
-            "Egress rules > Allowed domains > Add destination > add the target (Type = DNS_NAME; use "
-            "its registrable parent suffix to cover related hosts). Leave 'Network access' on "
-            "'Restricted access to specific destinations' — you are adding one destination, not "
-            "opening the policy up."
-            + (f" {_companion}" if _companion else "")
-        )
+        host = md.get("target_host", "") or "the target"
+        cause = (f"The network policy '{policy_id}' attached to this workspace does not allow "
+                 f"{host}, so serverless compute cannot reach it.")
+        where = "Egress rules > Allowed domains"
     return Diagnosis(
         pattern_id="egress_policy_blocks",
-        title="Serverless Egress Blocked by the Network Policy (Egress Rules)",
+        title="Serverless Egress Blocked by the Network Policy",
         severity=Severity.CRITICAL,
         confidence="high",
         root_cause=cause,
         evidence=[("egress_policy", ep.message)],
         prescription=[
-            f"Account Console > Security > Context based ingress and egress > open the workspace "
-            f"network policy '{policy_id}' (the one attached to this workspace) > Egress tab.",
-            add_step,
-            "Save. Egress changes propagate to serverless within a few minutes (not instantaneous).",
-            "Re-run the diagnostic; the same failing target should now PASS.",
-        ],
-        follow_up_questions=[
-            "Are other destinations from the same provider (same parent domain) also failing?",
+            f"Account Console > Security > Context based ingress and egress > '{policy_id}' > "
+            f"{where}.",
         ],
         fix_order=1,
     )
@@ -1360,9 +1357,7 @@ def _rule_egress_policy_dry_run(checks):
         prescription=[
             f"Account Console > Security > Context based ingress and egress > '{policy_id}' > Egress > "
             "Egress rules > Allowed domains > Add destination (Type = DNS_NAME) — add the target BEFORE "
-            "switching Policy enforcement mode from 'Dry run' to 'Enforced for all products'."
-            + (f" {companion_egress_clause(md.get('target_host', ''))}"
-               if companion_egress_clause(md.get("target_host", "")) else ""),
+            "switching Policy enforcement mode from 'Dry run' to 'Enforced for all products'.",
             "Query system.access.network_outbound (filter on workspace_id and the target's DNS name) to "
             "confirm the violation log.",
             "If the customer expects blocking behavior, set Policy enforcement mode = 'Enforced' after "

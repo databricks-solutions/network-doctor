@@ -7,7 +7,8 @@ inserted by SKILL.md Step 1). Also works exec-loaded for back-compat.
 import html as html_module
 import re as _re
 
-from models import (CheckResult, Diagnosis, DiagnosticReport, Severity, Status,
+from models import (ACCOUNT_HANDOFF_META, CheckResult, Diagnosis, DiagnosticReport,
+                    Severity, Status,
                     __version__, actionable_diagnoses, check_verdict_counts,
                     headline_words, is_unverified_skip, limitations_items,
                     merge_gate_skips, report_rows, split_skipped_rows,
@@ -358,6 +359,18 @@ def build_dashboard(reports, ai_diagnosis, problem_text, timestamp):
               <h4 style="margin:0 0 12px;color:#856404;font-size:0.95em;">Quick Fix Checklist</h4>
               {rec_items}
             </div>'''
+        # The account-layer hand-off is a SKIP row, so the checklist above never shows it.
+        # The chat names it in one line and points here, so this is where its options,
+        # what the script collects and how to resume must be rendered in full.
+        handoffs = [c for c in r["checks"]
+                    if (getattr(c, "metadata", None) or {}).get(ACCOUNT_HANDOFF_META)
+                    and (c.recommendation or "").strip()]
+        if handoffs:
+            recs_html += "".join(f'''
+            <div style="margin-top:16px;padding:16px;background:#e8f1f8;border-radius:6px;">
+              <h4 style="margin:0 0 12px;color:#1b3a4b;font-size:0.95em;">Closing the gap &mdash; {_esc(c.check_name)}</h4>
+              <pre style="margin:0;white-space:pre-wrap;font-size:0.85em;color:#333;font-family:inherit;">{_esc(c.recommendation)}</pre>
+            </div>''' for c in handoffs)
 
         overall_icon = "&#9989;" if r["overall"] == Status.PASS else ("&#10060;" if r["overall"] == Status.FAIL else "&#9888;&#65039;")
         card_bg = '#d4edda' if r['overall']==Status.PASS else '#f8d7da' if r['overall']==Status.FAIL else '#fff3cd'

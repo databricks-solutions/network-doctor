@@ -7,9 +7,9 @@ inserted by SKILL.md Step 1). Also works exec-loaded for back-compat.
 import json
 import time
 
-from models import (CheckResult, SKIP_KIND_META, SKIP_NOT_APPLICABLE,
-                    SKIP_UNVERIFIED, Status,
-                    companion_egress_clause as _companion_clause)
+from models import (ACCOUNT_HANDOFF_META, CheckResult, SKIP_KIND_META,
+                    SKIP_NOT_APPLICABLE,
+                    SKIP_UNVERIFIED, Status)
 from storage_access_checks import AZURE_DATABRICKS_APP_ID
 
 
@@ -295,11 +295,6 @@ ACCOUNT_DUMP_ENVELOPE = "__account_data__"
 # instead of each check inventing its own dead-end sentence.
 ACCOUNT_UNREADABLE_META = "account_unreadable"
 
-# Metadata flag: this row carries an ACTIONABLE hand-off (a read-only snapshot script
-# plus who can run it), not merely a description of the gap. A gap with an action
-# attached must show the action — that is the whole point of this change — and the
-# limits block prints messages only, so the chat composer keys on this instead.
-ACCOUNT_HANDOFF_META = "account_handoff"
 
 # Placeholder the hand-off text carries until the script has been written to a file and
 # its real path is known. Substituted once, on the row, so the chat and the dashboard
@@ -1392,9 +1387,8 @@ def check_egress_policy(account_host, account_id, workspace_id, token,
     mode, mode_desc = _format_enforcement(policy_enforcement)
     enforcement_blurb = f"policy_enforcement={mode} ({mode_desc})"
     base_meta = {
-        # The diagnosis rules need the destination to prescribe against (e.g. to name the
-        # companion host a package index serves its payload from). Carry it explicitly
-        # rather than making a consumer re-parse it out of `target` ("host:port").
+        # The diagnosis rules name the destination the policy does not allow. Carry it
+        # explicitly rather than making a consumer re-parse it out of `target` ("host:port").
         "target_host": target_host,
         "network_policy_id": policy_id,
         "restriction_mode": restriction,
@@ -1471,10 +1465,6 @@ def check_egress_policy(account_host, account_id, workspace_id, token,
             f"  open the workspace network policy '{policy_id}' > Egress tab >\n"
             f"  Egress rules > Allowed domains > Add destination:\n"
             f"    destination = {target_host}   (Type = DNS_NAME)\n"
-            + (f"  {_companion_clause(target_host)}\n" if _companion_clause(target_host) else "")
-            + f"  Or add the parent suffix (e.g. the registrable domain) to cover related hosts.\n"
-            f"  Leave 'Network access' on 'Restricted access to specific destinations' — you are\n"
-            f"  adding one destination, not opening the policy up.\n"
             f"Or via API: PATCH /api/2.0/accounts/{{account_id}}/network-policies/{policy_id}\n"
             f"  egress.network_access.allowed_internet_destinations += "
             f"{{'destination':'{target_host}','internet_destination_type':'DNS_NAME'}}"))

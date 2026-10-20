@@ -324,19 +324,18 @@ generate_account_dump_script(account_id, workspace_id, workspace_url="", account
 load_account_dump(source)   # dict | JSON string | workspace path ("/Users/<email>/account_dump.json")
 account_dump_read_plan(account_id, workspace_id, account_host="")  # the read-only GETs, for an admin who prefers curl
 # PROTOCOL, when a report row says the account layer was not read:
-#   1. Post result['account_snapshot_script_path'] — the PATH, one line. NEVER paste the
-#      script into chat: measured live, 4,386 characters of inline Python made the
+#   1. chat_prescription already carries the hand-off as ONE 'Closing the gap' line,
+#      with result['account_snapshot_script_path'] in it. Add nothing: do NOT repeat the
+#      path, do NOT expand the line into its options (they are in the dashboard), and
+#      NEVER paste the script — measured live, 4,386 characters of inline Python made the
 #      customer scroll past the two real sentences that followed it. There is no
 #      'account_snapshot_script' key any more, deliberately.
-#   1b. Do NOT restate or summarise the hand-off. chat_prescription already contains it
-#      in full under 'Closing the gap'; a second block ~350 words later made the reader
-#      cross the payload to discover it was not new.
-#   2. Name what stays unknown until then: whether an NCC is attached, its
-#      private-endpoint rules, and the attached egress network policy. NEVER say an NCC
-#      is or is not attached — that read did not answer.
-#   3. Offer "grant the Service Principal account-admin status" ONLY as the fallback, and
-#      say why it is the fallback (a permanent high privilege on a non-human identity,
-#      which many organisations refuse).
+#   2. The cause already says the account was not read. NEVER say an NCC is or is not
+#      attached, or that the policy does or does not allow the target — that read did not
+#      answer.
+#   3. If the customer asks about the other options, "grant the Service Principal
+#      account-admin status" is the fallback, and say why (a permanent high privilege on
+#      a non-human identity, which many organisations refuse).
 #   4. RESUMING LATER IS THE NORMAL CASE, not the exception: the wait is an account
 #      admin's calendar, typically one to two days. Nothing expires. In ANY later
 #      session (fresh notebook, fresh browser, days on), when the customer says the
