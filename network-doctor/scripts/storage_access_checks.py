@@ -239,30 +239,124 @@ def get_table_storage_info(workspace_url, token, full_table_name):
     return result
 
 
-def get_access_connector_for_table(workspace_url, token, catalog_name):
-    """Trace the credential chain: catalog → storage credential → Access Connector.
+def _location_key(url):
+    """`abfss://container@account.dfs.core.windows.net/path` with the authority lowercased
+    and one trailing slash, so a prefix test cannot match `.../data2` against `.../data`."""
+    u = str(url or "").strip()
+    if "://" in u:
+        scheme, rest = u.split("://", 1)
+        authority, _, path = rest.partition("/")
+        u = f"{scheme.lower()}://{authority.lower()}/{path}"
+    return u.rstrip("/") + "/"
 
-    Checks the catalog first for a custom storage credential, then falls back
-    to the metastore's default. This is deterministic — it does NOT guess by
-    listing all Access Connectors in the subscription.
 
-    Args:
-        workspace_url: Databricks workspace URL
-        token: Databricks API token
-        catalog_name: Name of the catalog containing the table
+def get_access_connector_for_location(workspace_url, token, storage_location):
+    """Trace the credential chain the way Unity Catalog does for a path: the external
+    location whose URL is the longest prefix of `storage_location` → its storage
+    credential → the Access Connector.
 
     Returns:
         dict with keys: access_connector_id, credential_name, credential_source
-                        (\"catalog\" or \"metastore\"), metastore_id, error
+                        ("external_location" when one covers the path, else ""),
+                        external_location, error
     """
     import requests as _req
 
     base = f"https://{workspace_url}" if not workspace_url.startswith("https://") else workspace_url
     headers = {"Authorization": f"Bearer {token}"}
+    result = {"access_connector_id": "", "credential_name": "", "credential_source": "",
+              "external_location": "", "error": ""}
+    want = _location_key(storage_location)
+    best, page = None, ""
+    try:
+        while True:
+            resp = _req.get(f"{base}/api/2.1/unity-catalog/external-locations",
+                            headers=headers, timeout=15,
+                            params={"max_results": 1000, **({"page_token": page} if page else {})})
+            if resp.status_code != 200:
+                result["error"] = f"Could not list external locations: HTTP {resp.status_code}"
+                return result
+            body = resp.json()
+            for loc in body.get("external_locations", []) or []:
+                key = _location_key(loc.get("url"))
+                if want.startswith(key) and (best is None or len(key) > len(_location_key(best.get("url")))):
+                    best = loc
+            page = body.get("next_page_token") or ""
+            if not page:
+                break
+        if best is None:
+            result["error"] = f"No external location covers {storage_location}"
+            return result
+        result["external_location"] = best.get("name", "")
+        result["credential_name"] = best.get("credential_name", "")
+        result["credential_source"] = "external_location"
+        _access_connector_of_credential(base, headers, result)
+    except Exception as e:
+        result["error"] = f"Error tracing credential chain: {e}"
+    return result
+
+
+def _access_connector_of_credential(base, headers, result):
+    """Fill result["access_connector_id"] (or result["error"]) from result["credential_name"]."""
+    import requests as _req
+
+    cred_resp = _req.get(
+        f"{base}/api/2.1/unity-catalog/storage-credentials/{result['credential_name']}",
+        headers=headers, timeout=15,
+    )
+    if cred_resp.status_code != 200:
+        result["error"] = f"Could not get storage credential '{result['credential_name']}': HTTP {cred_resp.status_code}"
+        return
+    cred = cred_resp.json()
+    ami = cred.get("azure_managed_identity", {})
+    result["access_connector_id"] = ami.get("access_connector_id", "")
+    if not result["access_connector_id"]:
+        if cred.get("azure_service_principal"):
+            result["error"] = (
+                f"Storage credential '{result['credential_name']}' uses a Service Principal, "
+                "not an Access Connector. SP-based credentials are managed differently."
+            )
+        else:
+            result["error"] = f"Could not find Access Connector in credential '{result['credential_name']}'"
+
+
+def get_access_connector_for_table(workspace_url, token, catalog_name, storage_location=""):
+    """Trace the credential chain: table path → storage credential → Access Connector.
+
+    With the table's `storage_location`, the external location covering that path decides
+    the credential — that is how Unity Catalog itself picks it. Only when no external
+    location covers the path does it fall back to the catalog's credential, then the
+    metastore's default. Seen live: an external table whose external location had been
+    re-pointed to a second credential was traced to the metastore default instead, so the
+    RBAC layer was never read and the run ended with "nothing I could prove is blocking".
+    Deterministic — it does NOT guess by listing all Access Connectors in the subscription.
+
+    Args:
+        workspace_url: Databricks workspace URL
+        token: Databricks API token
+        catalog_name: Name of the catalog containing the table
+        storage_location: the table's storage_location (abfss://...), when known
+
+    Returns:
+        dict with keys: access_connector_id, credential_name, credential_source
+                        ("external_location", "catalog" or "metastore"), external_location,
+                        metastore_id, error
+    """
+    import requests as _req
+
+    base = f"https://{workspace_url}" if not workspace_url.startswith("https://") else workspace_url
+    headers = {"Authorization": f"Bearer {token}"}
+    if storage_location:
+        by_path = get_access_connector_for_location(workspace_url, token, storage_location)
+        # An external location that covers the path is authoritative, even when its
+        # credential could not be read: falling back would report a DIFFERENT identity.
+        if by_path.get("credential_source") == "external_location":
+            return dict(by_path, metastore_id="")
     result = {
         "access_connector_id": "",
         "credential_name": "",
         "credential_source": "",
+        "external_location": "",
         "metastore_id": "",
         "error": "",
     }
@@ -306,26 +400,7 @@ def get_access_connector_for_table(workspace_url, token, catalog_name):
                 return result
 
         # Step 3: Get the storage credential → Access Connector
-        cred_resp = _req.get(
-            f"{base}/api/2.1/unity-catalog/storage-credentials/{result['credential_name']}",
-            headers=headers, timeout=15,
-        )
-        if cred_resp.status_code != 200:
-            result["error"] = f"Could not get storage credential '{result['credential_name']}': HTTP {cred_resp.status_code}"
-            return result
-
-        cred = cred_resp.json()
-        ami = cred.get("azure_managed_identity", {})
-        result["access_connector_id"] = ami.get("access_connector_id", "")
-
-        if not result["access_connector_id"]:
-            if cred.get("azure_service_principal"):
-                result["error"] = (
-                    f"Storage credential '{result['credential_name']}' uses a Service Principal, "
-                    "not an Access Connector. SP-based credentials are managed differently."
-                )
-            else:
-                result["error"] = f"Could not find Access Connector in credential '{result['credential_name']}'"
+        _access_connector_of_credential(base, headers, result)
 
     except Exception as e:
         result["error"] = f"Error tracing credential chain: {e}"

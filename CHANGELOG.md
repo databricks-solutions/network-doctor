@@ -29,6 +29,12 @@ Quote it if you need help with a result.
   other destination to allow, no advice on how to set the policy. When your Databricks
   account could not be read, the chat says so in one line with the path of the read-only
   script an account admin can run. The full options are in the dashboard.
+- **A table's Access Connector is the one Unity Catalog actually uses.** The storage
+  diagnosis traced the identity from the catalog or the metastore default, so a table under
+  an external location with its own credential had its role assignments read for the wrong
+  connector, or not at all, and the run ended without a cause. The connector now comes from
+  the external location that covers the table's path, and a missing role is reported with
+  the connector, the credential and the external location named.
 
 ## 1.1.0 — 2026-09-07
 

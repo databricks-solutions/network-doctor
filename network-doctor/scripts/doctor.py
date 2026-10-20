@@ -33,6 +33,7 @@ from models import (
     CAVEAT_MARKERS as _CAVEAT_MARKERS,
     CheckResult, Diagnosis, Severity, Status,
     SERVERLESS_PLANE_CHECKS as _SERVERLESS_PLANE_CHECKS,
+    SKIP_KIND_META, SKIP_NOT_APPLICABLE,
     SKIP_RESTATEMENT_MARKERS as _SKIP_RESTATEMENT_MARKERS,
     actionable_diagnoses, cannot_conclude, check_label as _check_label,
     check_verdict_counts, headline_words,
@@ -3733,7 +3734,8 @@ def _nsp_grants_access(nsp):
         and any(m.lower() == "enforced" for m in (nsp.metadata.get("access_modes") or []))
     )
 
-def _compose_storage_diagnosis(fqdn, fw, nsp, ac_in_rules, roles, ac_id, egress_trace=None):
+def _compose_storage_diagnosis(fqdn, fw, nsp, ac_in_rules, roles, ac_id, egress_trace=None,
+                               ac_info=None):
     """Pick EXACTLY ONE Diagnosis from the check outcomes, network before RBAC.
 
     Returns list[Diagnosis] (0 or 1). This replaces the hand-authored
@@ -3866,19 +3868,28 @@ def _compose_storage_diagnosis(fqdn, fw, nsp, ac_in_rules, roles, ac_id, egress_
     # 4) Network OK but RBAC missing (Storage Blob Delegator / data role).
     if roles is not None and roles.status == Status.FAIL:
         missing = ", ".join(roles.metadata.get("missing_roles") or []) or "required storage role(s)"
+        # Name what was read: the connector, and where Unity Catalog got it from. "The
+        # Access Connector's managed identity" left the customer to work out which of their
+        # connectors, and the one in question is often a second, newer one.
+        info = ac_info or {}
+        ac_name = (ac_id or "").rstrip("/").split("/")[-1] or "the Access Connector"
+        via = ""
+        if info.get("credential_name"):
+            via = f" (storage credential `{info['credential_name']}`"
+            via += (f" of external location `{info['external_location']}`)"
+                    if info.get("external_location") else ")")
+        account = fqdn.split(".")[0]
         return [Diagnosis(
             pattern_id="storage_rbac_missing",
             title="Access Connector Identity Missing Storage Role(s)",
             severity=Severity.HIGH, confidence="high",
             root_cause=(
-                f"The network path to `{fqdn}` is open, but the Access Connector's managed identity is "
-                f"missing required role(s): {missing}. Serverless uses a User Delegation SAS, which "
-                "needs Storage Blob Delegator on the account plus a data-plane role."),
+                f"The Access Connector `{ac_name}`{via} is missing {missing} on the storage "
+                f"account `{account}`. The network path is open, so this is what blocks the read."),
             evidence=[(roles.check_name, roles.message)],
             prescription=[
-                f"Storage account > Access Control (IAM) > Add role assignment: grant {missing} to the "
-                "Access Connector's managed identity.",
-                "Re-test after ~5 min for role propagation."],
+                f"Azure Portal > storage account `{account}` > Access control (IAM) > Role "
+                f"assignments: `{ac_name}` needs {missing}."],
             fix_order=1)]
 
     return []  # network + RBAC both clean — no blocking storage issue
@@ -3944,13 +3955,14 @@ def _resolve_storage_target(s, path, ws):
               "host) — asking for one rather than stopping.")
         return None, _emit_need_input(s, path)
 
-    ac_id = ""
+    ac_id, ac_info = "", {}
     if table_info.get("catalog_name"):
         ac_info = get_access_connector_for_table(ws["workspace_url"], ws["token"],
-                                                 table_info["catalog_name"])
-        ac_id = (ac_info or {}).get("access_connector_id", "")
+                                                 table_info["catalog_name"],
+                                                 table_info.get("storage_location", "")) or {}
+        ac_id = ac_info.get("access_connector_id", "")
     return {"fqdn": fqdn, "account": account, "table_info": table_info, "ac_id": ac_id,
-            "degraded": degraded, "note": note}, None
+            "ac_info": ac_info, "degraded": degraded, "note": note}, None
 
 
 def _target_check(target):
@@ -4095,7 +4107,8 @@ def _stage_B(s, path):
     checks = [_target_check(target), fw, nsp]
     if ac_in_rules is None:
         checks.append(CheckResult("Resource Instance Rule (AC)", fqdn, Status.SKIP,
-                                  "Not applicable — firewall topology does not require resourceAccessRules."))
+                                  "Not applicable — firewall topology does not require resourceAccessRules.",
+                                  metadata={SKIP_KIND_META: SKIP_NOT_APPLICABLE}))
     elif ac_in_rules:
         checks.append(CheckResult("Resource Instance Rule (AC)", fqdn, Status.PASS,
                                   "Access Connector present in resourceAccessRules."))
@@ -4109,11 +4122,17 @@ def _stage_B(s, path):
     if roles is not None:
         checks.append(roles)
     elif not ac_id:
+        # The table may well have resolved — say which link of the chain broke, not that
+        # there was no table (live: the row claimed "no Unity Catalog table was resolved"
+        # beside a Diagnostic Target row naming the table and its storage account).
+        _why = (f"the table resolved to this storage account, but its Access Connector "
+                f"could not be traced ({(target.get('ac_info') or {}).get('error') or 'no credential found'})"
+                if table_info.get("storage_account") else "no Unity Catalog table was resolved")
         checks.append(CheckResult(
             "Storage Role Assignments", fqdn, Status.SKIP,
-            "Not evaluated — no Access Connector could be resolved for this target (no Unity "
-            "Catalog table was resolved), so there is no identity whose role assignments to read.",
-            recommendation="Re-run with the failing catalog.schema.table to include the RBAC layer."))
+            f"Not evaluated — {_why}, so there is no identity whose role assignments to read.",
+            recommendation=("" if table_info.get("storage_account") else
+                            "Re-run with the failing catalog.schema.table to include the RBAC layer.")))
     else:
         checks.append(CheckResult(
             "Storage Role Assignments", fqdn, Status.SKIP,
@@ -4128,7 +4147,8 @@ def _stage_B(s, path):
             metadata={"egress_trace": True, **_gate}))
 
     diagnoses = (_compose_storage_diagnosis(fqdn, fw, nsp, ac_in_rules, roles, ac_id,
-                                            egress_trace=egress_trace)
+                                            egress_trace=egress_trace,
+                                            ac_info=target.get("ac_info"))
                  + _degraded_target_diagnosis(target))
     for _d in diagnoses:  # M2 layer tag — storage diagnoses are storage-plane
         if not getattr(_d, "layer", ""):
