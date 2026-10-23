@@ -76,7 +76,7 @@ It classifies your problem automatically, in any language, into one of three pat
 
 - **Path A — Connectivity.** A cluster or serverless warehouse can't reach a data source: timeout, DNS failure, "cannot connect", `UnknownHostException`, Lakehouse Federation / JDBC failures.
 - **Path B — Storage / UC access.** `PERMISSION_DENIED`, `AbfsRestOperationException`, "request not authorized", a `SELECT` on a UC Volume or external table failing — **especially** when it works on one compute type and fails on the other (that asymmetry is a network signature, not an RBAC one).
-- **Path C — Cluster start / NHC.** A VNet-injected cluster can't bootstrap: `X_NHC_*`, "Network configuration failure", "Add nodes failed", `SERVICE_FAULT` / `X_UnexpectedLaunchFailure` launch errors.
+- **Path C — Cluster start / NHC.** A VNet-injected cluster can't bootstrap: `X_NHC_*`, "Network configuration failure", "Add nodes failed", `SERVICE_FAULT` / `X_UnexpectedLaunchFailure` launch errors. Also `METASTORE_DOWN` on a classic cluster (Hive metastore on TCP 3306, or legacy access still enabled on a UC workspace).
 
 Root causes are buried across layers — VNets, NSGs, route tables, firewalls, Private Endpoints, DNS zones, NCC configurations. **This tool automates the whole sweep — and reasons about what to check next based on what it finds.**
 

@@ -1643,6 +1643,181 @@ def _rule_nhc_dns_private_zone_misconfigured(checks):
     )
 
 
+def _rule_metastore_down_legacy_hive(checks):
+    """METASTORE_DOWN + workspace still on the Hive metastore / legacy access.
+
+    Databricks compute connects to the workspace Hive metastore by default even
+    after a Unity Catalog migration, unless Disable legacy access is on. Field
+    ASQ: jobs timing out with METASTORE_DOWN cleared after Disable legacy access
+    plus a UC default catalog. That is a workspace-setting cause, not an NSG one.
+    """
+    nhc = _find(checks, "nhc_parse")
+    if nhc is None or not ((nhc.metadata or {}).get("signals") or {}).get("metastore_down"):
+        return None
+    setting = _find(checks, "ws_legacy_hive")
+    md = (setting.metadata or {}) if setting else {}
+    unread = setting is None or not md.get("readable", False)
+    already_uc_only = bool(md.get("legacy_access_disabled")) and not md.get("hive_default_catalog")
+    if already_uc_only and not _has_status(setting, Status.FAIL, Status.WARN):
+        return None
+
+    if unread:
+        confidence = "medium"
+        needs = True
+        root = (
+            "The compute event log shows METASTORE_DOWN. Classic clusters still open a "
+            "connection to the workspace Hive metastore (TCP 3306) unless Disable legacy "
+            "access is on — including on Unity Catalog workspaces. This run could not read "
+            "that setting, so this is the first thing to confirm before treating it as a "
+            "pure NSG/firewall miss on port 3306."
+        )
+    else:
+        confidence = "high"
+        needs = False
+        default_ns = md.get("default_namespace") or "hive_metastore"
+        root = (
+            "Disable legacy access is OFF, so this workspace's classic compute still "
+            f"connects to the Hive metastore (default catalog '{default_ns}'). "
+            "METASTORE_DOWN is that path failing or stalling — seen in the field when a "
+            "notebook/job still targets Hive instead of Unity Catalog, then jobs time out "
+            "under load."
+        )
+
+    rec = (setting.recommendation if setting and setting.recommendation else (
+        "Set a Unity Catalog default catalog, then Workspace admin > Settings > Security > "
+        "Disable legacy access = Disabled (Allow legacy features = Disabled in some UIs). "
+        "Wait 5 minutes and restart clusters. Do this only if hive_metastore tables are "
+        "migrated or federated — after 30 days the setting cannot be reverted."
+    ))
+    evidence = [("nhc_parse", nhc.message)]
+    if setting is not None:
+        evidence.append(("ws_legacy_hive", setting.message))
+    return Diagnosis(
+        pattern_id="metastore_down_legacy_hive",
+        title="Cluster Still Uses the Workspace Hive Metastore (Legacy Access On)",
+        severity=Severity.HIGH,
+        confidence=confidence,
+        root_cause=root,
+        evidence=evidence,
+        prescription=[
+            rec,
+            "OPTION B (only if you must keep Hive) — do not disable legacy access. Instead "
+            "allow TCP 3306 from the data-plane subnets to the regional metastore "
+            "(Sql service tag / consolidated-<region>-prod-metastore.mysql.database.azure.com). "
+            "Do not pin metastore IPs. A WAF/proxy such as Squid cannot front this path.",
+        ],
+        follow_up_questions=[
+            "Does this workspace still need the hive_metastore catalog, or should all "
+            "workloads use Unity Catalog only?",
+        ] if needs else [],
+        needs_confirmation=needs,
+        fix_order=1,
+    )
+
+
+def _rule_metastore_down_hive_egress(checks):
+    """METASTORE_DOWN + NSG/firewall missing Sql :3306."""
+    nhc = _find(checks, "nhc_parse")
+    if nhc is None or not ((nhc.metadata or {}).get("signals") or {}).get("metastore_down"):
+        return None
+    sql_nsg = []
+    for key in ("public_subnet_nsg", "private_subnet_nsg"):
+        c = _find(checks, key)
+        if c is None:
+            continue
+        missing = (c.metadata or {}).get("missing_tags") or []
+        if "Sql" in missing or _has_status(c, Status.FAIL) and "Sql" in (c.message or ""):
+            sql_nsg.append(c)
+    fw = _find(checks, "forced_tunnel_firewall")
+    fw_misses_hive = bool(
+        fw is not None and _has_status(fw, Status.FAIL)
+        and "hive_metastore" in ((fw.metadata or {}).get("missing") or [])
+    )
+    if not sql_nsg and not fw_misses_hive:
+        return None
+    evidence = [("nhc_parse", nhc.message)]
+    prescription = []
+    if sql_nsg:
+        evidence.extend((c.check_name, c.message) for c in sql_nsg)
+        prescription.append(
+            sql_nsg[0].recommendation
+            or "Add an outbound Allow VirtualNetwork -> Sql on TCP 3306 on the data-plane NSGs "
+               "(or set requiredNsgRules=AllRules so Databricks deploys the canonical Sql rule)."
+        )
+    if fw_misses_hive:
+        evidence.append(("forced_tunnel_firewall", fw.message))
+        prescription.append(
+            fw.recommendation
+            or "On the forced-tunnel firewall, allow the Sql service tag (or the regional "
+               "metastore FQDN) on TCP 3306. Do not pin metastore IPs."
+        )
+    return Diagnosis(
+        pattern_id="metastore_down_hive_egress",
+        title="Data-Plane Egress to the Hive Metastore on TCP 3306 Is Blocked",
+        severity=Severity.CRITICAL,
+        confidence="high",
+        root_cause=(
+            "METASTORE_DOWN means the cluster cannot complete its connection to the "
+            "workspace Hive metastore on TCP 3306. This run found the Sql/3306 allow "
+            "missing on the data-plane NSG and/or the forced-tunnel firewall."
+        ),
+        evidence=evidence,
+        prescription=prescription or [
+            "Allow TCP 3306 from the Databricks data-plane subnets to the Sql service tag "
+            "and the regional metastore FQDN. Confirm no WAF/proxy intercepts MySQL.",
+        ],
+        fix_order=1,
+    )
+
+
+def _rule_metastore_down_reachability(checks):
+    """METASTORE_DOWN with no setting FAIL and no Sql/3306 FAIL — still not healthy.
+
+    Official compute troubleshooting: METASTORE_DOWN with a WAF/proxy on the path.
+    Also covers UDR/DNS to *.mysql.database.azure.com that ARM did not name.
+    """
+    nhc = _find(checks, "nhc_parse")
+    if nhc is None or not ((nhc.metadata or {}).get("signals") or {}).get("metastore_down"):
+        return None
+    if _rule_metastore_down_hive_egress(checks) is not None:
+        return None
+    setting = _find(checks, "ws_legacy_hive")
+    if setting is not None and _has_status(setting, Status.FAIL):
+        return None
+    return Diagnosis(
+        pattern_id="metastore_down_reachability",
+        title="Hive Metastore Path Is Down — Confirm 3306 Reachability and WAF/Proxy",
+        severity=Severity.HIGH,
+        confidence="medium",
+        root_cause=(
+            "METASTORE_DOWN is on the compute event log. NSG/firewall did not report a "
+            "missing Sql:3306 allow, so the remaining network causes are DNS, a forced-tunnel "
+            "appliance this run could not fully read, or a WAF/proxy (Squid and similar) "
+            "in front of the metastore — compute members must reach services that do not "
+            "work over a WAF."
+        ),
+        evidence=[("nhc_parse", nhc.message)]
+                 + ([("ws_legacy_hive", setting.message)] if setting is not None else []),
+        prescription=[
+            "From a VM in the workspace host/data-plane subnet, test "
+            "`nc -z -v -w5 consolidated-<region>-prod-metastore.mysql.database.azure.com 3306` "
+            "(region FQDN: learn.microsoft.com Azure Databricks IP/domain list). "
+            "A timeout is a route/firewall/DNS miss, not a Databricks outage.",
+            "If that path must stay open: allow the Sql service tag on TCP 3306 using "
+            "service tags, not pinned IPs (metastore IPs change). Remove WAF/proxy from "
+            "this flow.",
+            "If the workspace should be Unity Catalog only: Disable legacy access and set "
+            "a UC default catalog instead of opening 3306 — clusters will stop calling HMS.",
+        ],
+        follow_up_questions=[
+            "Is there a WAF, Squid proxy, or TLS-inspecting appliance on egress from the "
+            "Databricks subnets toward *.mysql.database.azure.com:3306?",
+        ],
+        needs_confirmation=True,
+        fix_order=2,
+    )
+
+
 def _rule_nhc_subnet_nsg_missing_databricks_rules(checks):
     """Either subnet's NSG missing the AzureDatabricks service-tag rules during NHC."""
     nhc = _find(checks, "nhc_parse")
@@ -1904,6 +2079,8 @@ def _rule_launch_failure_arm_clean(checks):
     md = (nhc.metadata or {}) if nhc else {}
     if not md.get("is_launch_failure"):
         return None
+    if (md.get("signals") or {}).get("metastore_down"):
+        return None
     # Only when no infra check failed (otherwise a specific rule owns the cause).
     for name, check in checks.items():
         if name == "nhc_parse":
@@ -2118,6 +2295,9 @@ _RULES = [
     _rule_nhc_dns_private_zone_misconfigured,
     _rule_nhc_subnet_nsg_missing_databricks_rules,
     _rule_nhc_subnet_delegation_missing,
+    _rule_metastore_down_hive_egress,
+    _rule_metastore_down_legacy_hive,
+    _rule_metastore_down_reachability,
     _rule_launch_failure_arm_clean,
     # Reachability outranks the firewall's allow-list: if the packets can't reach the
     # appliance, its rules are irrelevant and must not become the headline.
@@ -2157,6 +2337,9 @@ _PATTERN_PRECEDENCE = {
     "nhc_firewall_missing_egress": 15,            # forced-tunnel firewall drops required egress (UDR wins over NSG)
     "nhc_subnet_nsg_missing_databricks_rules": 20,  # control-plane auth blocked (AllRules fix)
     "nhc_subnet_nsg_backend_pl_expected": 21,
+    "metastore_down_hive_egress": 22,             # Sql :3306 missing on NSG/firewall
+    "metastore_down_legacy_hive": 23,             # still on HMS; disable legacy + UC catalog
+    "metastore_down_reachability": 24,            # WAF/proxy / 3306 path unverified
     "nhc_forced_tunneling_blackhole": 30,         # egress path broken (UDR/NVA/blackhole)
     "nhc_private_link_only_no_pe": 40,            # private-link topology incomplete
     "nhc_dns_private_zone_misconfigured": 50,     # name resolution for control plane
@@ -2203,7 +2386,8 @@ def _layer_for(pattern_id):
         return "ncc-serverless"
     if pattern_id in _STORAGE_PATTERNS or pattern_id.startswith("storage_"):
         return "storage"
-    if pattern_id.startswith("nhc_") or pattern_id.startswith("launch_failure"):
+    if (pattern_id.startswith("nhc_") or pattern_id.startswith("launch_failure")
+            or pattern_id.startswith("metastore_down_")):
         return "classic-vnet"
     if pattern_id in ("all_healthy", "nsg_pass_eliminates"):
         return ""

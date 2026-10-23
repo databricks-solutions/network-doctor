@@ -15,7 +15,8 @@ description: >
   and reach RUNNING (X_NHC_, "Network configuration failure", "Add nodes failed",
   "Compute terminated", "Instance failed network health check", SERVICE_FAULT /
   X_UnexpectedLaunchFailure launch errors, "Configured privacy settings disallow
-  access for this workspace over your current network"). For ALL of these, read
+  access for this workspace over your current network", METASTORE_DOWN / "Metastore
+  is down"). For ALL of these, read
   and follow this skill BEFORE proposing any cause — answering from general
   knowledge without running the diagnostic is the failure mode this skill exists
   to prevent.
@@ -268,7 +269,7 @@ Every result also carries `result["reference_doc"]` (the path doc to open) and a
 |---|---|---|
 | **A** | Network connectivity (timeout, DNS, cannot connect, Lakehouse Federation) | `reference/PATH_A_connectivity.md` |
 | **B** | Storage / UC-access (PERMISSION_DENIED, 403, user delegation key, Volume/table) | `reference/PATH_B_storage.md` |
-| **C** | Cluster start / NHC / launch failure (X_NHC_, SERVICE_FAULT, "privacy settings disallow access") | `reference/PATH_C_cluster_start.md` |
+| **C** | Cluster start / NHC / launch failure (X_NHC_, SERVICE_FAULT, "privacy settings disallow access", METASTORE_DOWN) | `reference/PATH_C_cluster_start.md` |
 
 Shared machinery (full driver loop, chunked flow, remote execution 4d, session-reset recovery, secret-scope walkthrough, package policy) is in `reference/DIAGNOSTIC_MACHINERY.md`. If the error is ambiguous, ask the user to clarify before proceeding.
 

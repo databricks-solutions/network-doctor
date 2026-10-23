@@ -33,7 +33,7 @@ from cluster_start_checks import (
     check_forced_tunnel_firewall_egress, check_outbound_to_databricks_com,
     check_subnet_delegation, check_subnet_egress_ip,
     check_subnet_required_nsg_rules, check_subnet_route_table,
-    check_workspace_private_link,
+    check_workspace_legacy_hive_access, check_workspace_private_link,
     get_workspace_network_config, parse_nhc_error, probe_arm_reachability,
 )
 from correlation_engine import correlate, generate_summary
@@ -1758,7 +1758,7 @@ def diagnose_cluster_start(nhc_error_text, workspace_resource_id, arm_token="",
             public_subnet_routes, private_subnet_routes,
             public_subnet_egress_ip, private_subnet_egress_ip,
             ws_ip_access_list, ws_private_link, ws_private_dns,
-            outbound_databricks_com.
+            outbound_databricks_com, ws_legacy_hive (METASTORE_DOWN only).
     """
     completed = {}
     skipped = []
@@ -1840,6 +1840,8 @@ def _diagnose_cluster_start_inner(nhc_error_text, workspace_resource_id, arm_tok
             "Subnet Delegation", "(default networking)", Status.SKIP,
             "Workspace uses default Databricks-managed networking — VNet inject not in use.",
         )
+        if (nhc.get("signals") or {}).get("metastore_down"):
+            completed["ws_legacy_hive"] = check_workspace_legacy_hive_access(workspace_url)
         return _build_cluster_start_report(workspace_resource_id, completed, skipped, nhc,
                                            workspace_url=workspace_url)
 
@@ -1881,6 +1883,11 @@ def _diagnose_cluster_start_inner(nhc_error_text, workspace_resource_id, arm_tok
     # ws_backend_private_link already ran at step 2b (the NSG check consumes it).
     completed["ws_private_dns"] = check_dns_resolution_for_workspace(
         arm_token, vnet_id, workspace_url, ws_cfg["public_network_access"])
+    # METASTORE_DOWN: clusters still talk to the workspace Hive metastore unless
+    # Disable legacy access is on. Read that setting from the session identity
+    # (not ARM). Skip the extra API when the paste is a different Path C signature.
+    if (nhc.get("signals") or {}).get("metastore_down"):
+        completed["ws_legacy_hive"] = check_workspace_legacy_hive_access(workspace_url)
 
     # Step 5: derived outbound check (uses the private subnet's UDR result).
     _route_check = completed.get("private_subnet_routes") or completed.get("public_subnet_routes")
