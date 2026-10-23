@@ -16,7 +16,7 @@ import ipaddress as _ipaddress
 import re as _re
 import time as _time
 
-from models import CheckResult, Status
+from models import SKIP_KIND_META, SKIP_UNVERIFIED, CheckResult, Status
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +175,15 @@ def parse_nhc_error(error_text):
         r'network\s+health\s+check',
         r'\bNHC\b',                      # "falha no NHC", "NHC failure"
         r'failed\s+component\(s\)\s*:\s*control_plane',
+        # METASTORE_DOWN is a compute event, not an X_NHC_* code. It still belongs
+        # on Path C: the cluster is trying to reach the workspace Hive metastore
+        # (TCP 3306) or is still on legacy HMS when the customer expected UC.
+        r'\bMETASTORE_DOWN\b',
+        r'metastore\s+is\s+down',
     ]
     has_nhc_phrase = any(_re.search(p, text, _re.IGNORECASE) for p in _NHC_PHRASE_PATTERNS)
+    metastore_down = bool(_re.search(r'\bMETASTORE_DOWN\b|metastore\s+is\s+down',
+                                     text, _re.IGNORECASE))
     # If there's no canonical X_NHC_ code but we matched a launch-failure
     # signature, surface the most specific one as the error_code so the report
     # and the agent name the real symptom instead of "(unknown)".
@@ -239,7 +246,10 @@ def parse_nhc_error(error_text):
         "failed_hosts": [],
         "is_launch_failure": is_launch_failure,
         "launch_failure_signatures": launch_failure_signatures,
+        "metastore_down": metastore_down,
     }
+    if metastore_down and not error_code:
+        error_code = "METASTORE_DOWN"
     # X_NHC_STORAGE_SSL_ERROR is the canonical code for the bootstrap artifact
     # pull failing — keep it as a signal even if entity parsing came up short.
     if _re.search(r'X_NHC_STORAGE_SSL_ERROR', text, _re.IGNORECASE):
@@ -276,6 +286,7 @@ def parse_nhc_error(error_text):
         or bool(entities)
         or is_launch_failure
         or has_nhc_phrase
+        or metastore_down
     )
 
     return {
@@ -1444,6 +1455,177 @@ def check_workspace_ip_access_list(workspace_url, databricks_pat, egress_ips=Non
         metadata={"enabled": True, "allow": allow_cidrs, "block": block_cidrs})
 
 
+def _session_workspace_token():
+    """Best-effort notebook / env token for workspace Settings API reads.
+
+    Path C is ARM-first and does not collect a Databricks PAT. METASTORE_DOWN
+    still needs the workspace `disable_legacy_access` / default catalog settings,
+    which are not in ARM. The invoking notebook identity is enough when it can
+    read those settings; otherwise the check reports UNVERIFIED.
+    """
+    try:
+        import IPython
+        dbu = IPython.get_ipython().user_ns.get("dbutils")
+        if dbu is not None:
+            tok = dbu.notebook().getContext().apiToken().get()
+            if tok:
+                return tok
+    except Exception:
+        pass
+    try:
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+        tok = DBUtils(spark).notebook().getContext().apiToken().get()
+        if tok:
+            return tok
+    except Exception:
+        pass
+    import os
+    return os.environ.get("DATABRICKS_TOKEN") or ""
+
+
+def _settings_payload_value(payload, setting_key):
+    """Pull the boolean/string value out of a Settings API GET body."""
+    if not isinstance(payload, dict):
+        return None
+    node = payload.get(setting_key)
+    if isinstance(node, dict):
+        if "value" in node:
+            return node.get("value")
+        inner = node.get("namespace") or node.get("string_val") or node.get("boolean_val") or {}
+        if isinstance(inner, dict) and "value" in inner:
+            return inner.get("value")
+        if isinstance(inner, (str, bool)):
+            return inner
+    if "value" in payload:
+        return payload.get("value")
+    return None
+
+
+def check_workspace_legacy_hive_access(workspace_url, token=""):
+    """Read disable_legacy_access + default catalog (workspace Settings API).
+
+    Databricks compute still connects to the workspace Hive metastore unless
+    legacy access is disabled. Field-confirmed: METASTORE_DOWN on a UC workspace
+    cleared after Disable legacy access + a UC default catalog. This check is
+    read-only; it never changes the setting.
+    """
+    import requests as _req
+    start = _time.time()
+    target = workspace_url or "(no workspace url)"
+    tok = (token or "").strip() or _session_workspace_token()
+    if not workspace_url:
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.SKIP,
+            "workspace_url missing — cannot read disable_legacy_access.",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED, "readable": False},
+            duration_ms=(_time.time() - start) * 1000)
+    if not tok:
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.SKIP,
+            "Could not obtain a workspace token from this session, so Disable legacy "
+            "access and the default catalog are UNVERIFIED.",
+            recommendation=(
+                "Workspace admin > Settings > Security: set Disable legacy access to "
+                "'Disabled: legacy access features cannot be used' ONLY after the default "
+                "catalog is a Unity Catalog catalog (not hive_metastore). Then restart clusters."
+            ),
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED, "readable": False},
+            duration_ms=(_time.time() - start) * 1000)
+    base = workspace_url.rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    def _get_setting(name):
+        url = f"{base}/api/2.0/settings/types/{name}/names/default"
+        resp = _req.get(url, headers=headers, timeout=15)
+        return resp.status_code, (resp.json() if resp.content else {})
+
+    try:
+        la_code, la_body = _get_setting("disable_legacy_access")
+        ns_code, ns_body = _get_setting("default_namespace_ws")
+    except Exception as e:
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.SKIP,
+            f"Could not read workspace settings ({e}). Disable legacy access is UNVERIFIED.",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED, "readable": False, "error": str(e)},
+            duration_ms=(_time.time() - start) * 1000)
+
+    if la_code in (401, 403) or ns_code in (401, 403):
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.SKIP,
+            f"Workspace Settings API refused the session identity "
+            f"(disable_legacy_access HTTP {la_code}, default_namespace_ws HTTP {ns_code}). "
+            "The setting is UNVERIFIED.",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED, "readable": False,
+                      "http_legacy": la_code, "http_namespace": ns_code},
+            duration_ms=(_time.time() - start) * 1000)
+    if la_code != 200:
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.SKIP,
+            f"Could not read disable_legacy_access (HTTP {la_code}). UNVERIFIED.",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED, "readable": False,
+                      "http_legacy": la_code, "http_namespace": ns_code},
+            duration_ms=(_time.time() - start) * 1000)
+
+    legacy_disabled = bool(_settings_payload_value(la_body, "disable_legacy_access"))
+    default_ns = str(_settings_payload_value(ns_body, "default_namespace_ws") or "").strip()
+    hive_default = (not default_ns) or default_ns.lower() in ("hive_metastore", "spark_catalog")
+    md = {
+        "readable": True,
+        "legacy_access_disabled": legacy_disabled,
+        "default_namespace": default_ns,
+        "hive_default_catalog": hive_default,
+        "http_legacy": la_code,
+        "http_namespace": ns_code,
+    }
+    rec = (
+        "OPTION A (recommended when this workspace should be Unity Catalog only) — "
+        "set a Unity Catalog default catalog FIRST, then disable legacy Hive access:\n"
+        "  1. Workspace admin > Settings > Compute: Default catalog = a UC catalog "
+        "(required; disable_legacy_access cannot be turned on while the default is "
+        "hive_metastore / spark_catalog).\n"
+        "  2. Workspace admin > Settings > Security: Disable legacy access = "
+        "'Disabled: legacy access features cannot be used' "
+        "(some UIs label this as Allow legacy features = Disabled).\n"
+        "  3. Wait ~5 minutes, restart all running classic clusters, and point jobs at UC "
+        "catalogs (or set spark.databricks.unityCatalogOnlyMode=true and "
+        "spark.databricks.sql.initial.catalog.namespace=<uc_catalog> on the cluster).\n"
+        "WARNING: jobs that still read hive_metastore will fail. After 30 days the workspace "
+        "becomes UC-only and the setting cannot be reverted. Use Hive metastore federation "
+        "if you still need those tables under UC governance.\n"
+        "Docs: https://learn.microsoft.com/en-us/azure/databricks/data-governance/unity-catalog/disable-hms"
+    )
+    if not legacy_disabled:
+        why = (
+            "Disable legacy access is OFF, so classic compute still connects to the "
+            "workspace Hive metastore by default — even on a Unity Catalog workspace. "
+            "That HMS path (TCP 3306) is what surfaces as METASTORE_DOWN when it is "
+            "slow, blocked, or still used by a notebook/job."
+        )
+        if hive_default:
+            why += f" Default catalog is '{default_ns or 'hive_metastore'}', which keeps that path on."
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.FAIL, why,
+            recommendation=rec, metadata=md,
+            duration_ms=(_time.time() - start) * 1000)
+    if hive_default:
+        return CheckResult(
+            "Workspace Legacy Hive Access", target, Status.WARN,
+            "Disable legacy access is ON, but the workspace default catalog is still "
+            f"'{default_ns or 'hive_metastore'}'. Set a Unity Catalog default catalog so "
+            "new clusters do not fall back to Hive.",
+            recommendation=rec, metadata=md,
+            duration_ms=(_time.time() - start) * 1000)
+    return CheckResult(
+        "Workspace Legacy Hive Access", target, Status.PASS,
+        f"Disable legacy access is ON and the default catalog is '{default_ns}' "
+        "(not hive_metastore). Clusters should not be using the workspace Hive metastore.",
+        metadata=md, duration_ms=(_time.time() - start) * 1000)
+
+
 def _ip_in_cidr(ip_obj, cidr_str):
     try:
         return ip_obj in _ipaddress.ip_network(cidr_str, strict=False)
@@ -1844,12 +2026,25 @@ _REQUIRED_EGRESS = {
         # rule allowing *.dfs.core.windows.net was never credited as covering storage.
         "fqdn_suffixes": (".blob.core.windows.net", ".dfs.core.windows.net"),
         "fqdns": (),
+        "port": "443",
     },
     "control_plane": {
         "label": "Databricks control plane / SCC relay / webapp (AzureDatabricks tag / *.azuredatabricks.net / *.databricks.com :443)",
         "service_tags": ("azuredatabricks",),
         "fqdn_suffixes": (".azuredatabricks.net", ".databricks.com"),
         "fqdns": ("www.databricks.com",),
+        "port": "443",
+    },
+    # Workspace-local Hive metastore (not Unity Catalog). METASTORE_DOWN is the
+    # cluster event when this path is blocked or still in use after a UC migration.
+    # IPs on consolidated-<region>-prod-metastore.mysql.database.azure.com CHANGE;
+    # the Sql service tag is the documented allow, not a pinned address.
+    "hive_metastore": {
+        "label": "legacy Hive metastore :3306 (Sql service tag / *.mysql.database.azure.com)",
+        "service_tags": ("sql",),
+        "fqdn_suffixes": (".mysql.database.azure.com",),
+        "fqdns": (),
+        "port": "3306",
     },
 }
 
@@ -2002,13 +2197,15 @@ def _fw_normalize_rules(rule_collections, rcg_priority=0):
 
 
 def _fw_rule_matches_category(entry, category):
-    """Does this rule entry match the required-egress category on TCP/443?
+    """Does this rule entry match the required-egress category on its documented port?
     Returns (matches: bool, matched_on: 'tag'|'fqdn'|None)."""
     spec = _REQUIRED_EGRESS[category]
-    if not _fw_port_matches(entry["ports"]) or not _fw_proto_matches(entry["protos"]):
+    want = spec.get("port", "443")
+    if not _fw_port_matches(entry["ports"], want) or not _fw_proto_matches(entry["protos"]):
         # app rules carry port inside protocols; if protos matched but no explicit
         # port (rare), fall through on port only when '*' tag present
-        if not (_fw_proto_matches(entry["protos"]) and _fw_port_matches(entry["ports"] or {"*"})):
+        if not (_fw_proto_matches(entry["protos"])
+                and _fw_port_matches(entry["ports"] or {"*"}, want)):
             return (False, None)
     tags = entry["dest_tags"]
     if "*" in tags or any(t in tags for t in spec.get("service_tags", ())):
@@ -2127,9 +2324,17 @@ def check_forced_tunnel_firewall_egress(arm_token, route_check, nhc, workspace_r
         if (sig.get("databricks_com_failure") or sig.get("databricks_com_403")
                 or any(("databricks.com" in h or "azuredatabricks.net" in h) for h in failed_hosts)):
             need.add("control_plane")
+        if sig.get("metastore_down") or any("mysql.database.azure.com" in h for h in failed_hosts):
+            need.add("hive_metastore")
         if not need:
             # No specific NHC host signal — bootstrap always needs both anyway.
             need = {"storage", "control_plane"}
+        # METASTORE_DOWN alone is not a control-plane/storage bootstrap failure.
+        # Demanding those categories here would red-flag a healthy firewall.
+        if sig.get("metastore_down") and need == {"storage", "control_plane", "hive_metastore"}:
+            if not (sig.get("storage_ssl_error") or sig.get("databricks_com_failure")
+                    or sig.get("databricks_com_403") or failed_hosts):
+                need = {"hive_metastore"}
     # Back-end Private Link carries the control plane via the databricks_ui_api PE,
     # not the forced-tunnel firewall — so control-plane egress is not a firewall
     # requirement here. (Storage egress still traverses the firewall.)
@@ -2311,6 +2516,13 @@ def check_forced_tunnel_firewall_egress(arm_token, route_check, nhc, workspace_r
             "    --name databricks-storage --collection-priority 200 --action Allow --rule-type NetworkRule \\\n"
             "    --rule-name adb-storage --source-addresses <adb-subnet-cidrs> \\\n"
             "    --destination-addresses 'Storage.<region>' 'AzureDatabricks' --destination-ports 443 --ip-protocols TCP"
+        )
+    if "hive_metastore" in missing:
+        rec += (
+            "\nAlso allow the legacy Hive metastore: NETWORK rule, destination service tag "
+            "'Sql' (or FQDN `consolidated-<region>-prod-metastore.mysql.database.azure.com`) "
+            "on TCP 3306. Do not pin metastore IPs — they change; use the Sql service tag. "
+            "A WAF/proxy (Squid and similar) cannot front this MySQL path."
         )
 
     # NEVER narrate an observation that was not made. `failed_hosts` is empty

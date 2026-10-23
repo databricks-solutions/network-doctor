@@ -5,6 +5,17 @@ Quote it if you need help with a result.
 
 ## Unreleased
 
+### Added
+
+- **`METASTORE_DOWN` is a cluster-start diagnosis.** A compute event log of
+  `METASTORE_DOWN` / "Metastore is down" now routes to Path C. Classic compute still
+  connects to the workspace Hive metastore unless Disable legacy access is on. The
+  report names two remediations, in order: (1) if the workspace should be Unity Catalog
+  only, set a UC default catalog then disable legacy access (field-confirmed; some UIs
+  label this Allow legacy features = Disabled); (2) if Hive must stay, allow TCP 3306
+  to the regional metastore using the Sql service tag — not pinned IPs — and keep
+  WAF/proxy off that path.
+
 ### Fixed
 
 - **Installation now works as documented, entirely in the UI.** Genie Code loads a skill
