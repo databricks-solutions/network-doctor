@@ -70,8 +70,21 @@ description: >
   continuation of this one. On SERVERLESS the driver still makes ONE credential
   offer AFTER the probes have produced a finding, even under `simple` — that is by
   design, so relay it; it is the only ask `simple` leaves alive. Path C is NOT asked
-  (no credential-free cluster-start diagnosis exists); if the driver did not ask, do
-  not invent the question.
+  the depth question at intake; if the driver did not ask, do not invent it. Path C
+  still has a lighter run: the access gate (3c) offers `simple`, and `none` to the
+  credential gives the same Databricks-only report (no Azure call).
+  (3c) **`sp_gate` questions are relayed VERBATIM, scope list and commands included.**
+  On a deep run the driver checks that the service principal can READ every Azure scope
+  the diagnosis uses. On a gap it STOPS with ONE NEED_INPUT question whose answer key is
+  `sp_gate`. Relay it exactly: the scopes and what lives in each, and every
+  `az role assignment create --role Reader ...` line. Those are read-only Reader grants
+  the CUSTOMER runs; never run them yourself, never summarize them, never drop one.
+  Present NO diagnosis, no likely cause, nothing drawn from the error text while it is
+  open. Pass the customer's choice as `answers={'sp_gate': 'retry'}` (re-check access,
+  then the deep run goes ahead) or `answers={'sp_gate': 'simple'}` (continue without
+  reading Azure); on Path C add `cluster_id` if they give one. A retry may name more
+  scopes (`partial`) — relay again. This is not the egress-block case: "ARM unreachable"
+  stays its own question and is not a permissions finding.
   (4) Always cite which check returned which status when stating a cause
   (e.g., "public_subnet_nsg returned FAIL with missing_tags=['AzureDatabricks']").
   If you have not run a check, you do not know.

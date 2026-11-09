@@ -43,12 +43,13 @@ from models import (
     split_skipped_rows, status_value,
 )
 from models import _norm_ws
-from cluster_start_checks import parse_nhc_error, probe_arm_reachability
+from cluster_start_checks import (arm_read_gate, arm_scope_of, drain_arm_denials,
+                                  parse_nhc_error, probe_arm_reachability)
 from correlation_engine import (_NO_CHANGE_MARKERS, cleared_appliances,
                                 established_blocking_causes, make_egress_firewall_diagnosis)
 from orchestrator import (
     _ACCOUNT_BLIND_ROW, _ARM_BLIND_ROW, continue_diagnosis, diagnose_cluster_start,
-    finalize_diagnosis,
+    diagnose_cluster_start_databricks_only, finalize_diagnosis,
     load_checkpoint, reopen_checks, start_diagnosis,
 )
 from serverless_ncc_checks import (
@@ -458,11 +459,11 @@ def _scope_setup_question(account_layer=False):
 #            Answers "which Azure object is responsible, and what exactly to change."
 #            Needs a read-only service principal in a Databricks secret scope.
 #
-# Path C is deliberately NOT asked. A cluster that will not start is diagnosed from
-# the workspace's ARM configuration and nothing else, so there is no credential-free
-# version of it to offer — a customer without a service principal is handed the Cloud
-# Shell dump flow instead (_stage_C), which reads ARM under their OWN identity.
-# Offering "simple" there would promise less work and then ask for more.
+# Path C is deliberately NOT asked at intake. A cluster that will not start is decided in
+# the workspace's Azure network, so the run starts deep. Its credential-free version — the
+# Databricks-only report (orchestrator.diagnose_cluster_start_databricks_only) — is reached
+# by `none` to the credential, or by `simple` at the read-access gate, where the customer
+# chooses it knowing exactly which scopes the credential could not read.
 _DEPTH_DEEP_TOKENS = ("deep", "full", "complete", "completa", "completo", "profunda",
                       "profundo", "detalhada", "detailed", "thorough", "everything",
                       "second", "segunda", "segundo", "option 2", "opcao 2", "op\u00e7\u00e3o 2")
@@ -914,13 +915,17 @@ def _normalize_answers(s):
     handled at stage time); a running id stays as-is; `none`/`no` clears it.
     """
     a = s["answers"]
+    # The read-access gate's answer comes before everything: `simple` there decides the
+    # depth, and it is the one way a Path C run becomes credential-free.
+    _apply_gate_choice(a)
     # DEPTH is the first fork, so it is normalized first: everything below is allowed to
     # override it, because what the customer supplied LAST is what they mean.
     if s.get("path") == "C":
-        # Not a choice on Path C — there is no credential-free cluster-start diagnosis to
-        # offer (see _depth_question). Set explicitly so the question is never asked and
-        # nothing downstream reads an empty depth as "not decided yet".
-        a["analysis_depth"] = "deep"
+        # Not an INTAKE choice on Path C (see _depth_question): the cluster-start diagnosis
+        # is decided in Azure, so it starts deep. The only way to `simple` is the read-access
+        # gate's offer, made once we KNOW the credential cannot read what the diagnosis
+        # needs. Set explicitly so nothing downstream reads an empty depth as undecided.
+        a["analysis_depth"] = "simple" if a.get(_SP_GATE_CHOICE) == "simple" else "deep"
     if not a.get("analysis_depth") and s.get("checkpoint_path"):
         # A session that already has recorded work predates this question (or was mid-run
         # when it landed). Asking "how far should I go?" halfway through a diagnosis is
@@ -3259,6 +3264,375 @@ def _emit_in_progress(s, path, next_call):
 # Stage handlers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The service principal's READ-ACCESS GATE
+# ---------------------------------------------------------------------------
+# A deep run used to start diagnosing the moment a token minted. When the SP could read
+# the spoke but not the hub — the route table, the peered VNet, the firewall — every
+# unreadable object looked like an ABSENT one, and the run handed over a confident
+# root cause built on what it never saw (live: a cluster that could not start, diagnosed
+# from serverless with egress allowed, with a strange answer and a permission gap behind
+# it). So before any check, cluster_start_checks.arm_read_gate verifies read on every
+# scope the diagnosis will read; on a gap the run STOPS — no diagnosis, no interim
+# finding — names each scope, the role and the exact grant, and offers `retry` or
+# `simple`. A 403 met DURING the checks (a scope first discovered mid-run) is caught by
+# the denial ledger and ends the same way. ARM being UNREACHABLE is not this: that keeps
+# its own outcome, because the fix is egress, not RBAC.
+
+_SP_GATE = "_sp_gate"                  # the last verdict: {"status", "key", "missing", ...}
+_SP_GATE_CHOICE = "_sp_gate_choice"    # "simple" once the customer chose it at the gate
+_SP_GATE_EXTRA = "_sp_gate_extra"      # [scope, holds, [action]] learned from the ledger
+_SP_GATE_REPLY = "_sp_gate_reply"      # THIS call's reading of the reply
+_SP_SCOPE_PARKED = "_sp_scope_parked"  # the scope set aside by `simple`
+
+_GATE_RETRY_TOKENS = ("retry", "re-run", "rerun", "run again", "try again", "check again",
+                      "granted", "i granted", "added", "done", "ready", "de novo",
+                      "tentar", "tente", "concedi", "pronto")
+
+# What `simple` does on each path, in words that are true there.
+_GATE_SIMPLE_TEXT = {
+    "A": ("I test the network path itself — whether the name resolves, the port answers "
+          "and TLS completes — plus the Databricks-side configuration. Every Azure layer "
+          "(NSGs, routes, firewall, peering, private DNS, private endpoints) is reported as "
+          "not checked."),
+    "B": ("I trace the Unity Catalog side only — the table, its external location, the "
+          "storage credential and the access connector. The storage account's firewall, "
+          "network perimeter and role assignments are reported as not checked, so it may "
+          "finish without naming a cause."),
+    "C": ("I read what Databricks itself recorded about the failed start — the error you "
+          "gave me, and the cluster's termination reason and event log when I have the "
+          "cluster id (send it with your answer as `cluster_id`). Every Azure layer (NSGs, "
+          "routes, firewall, DNS, private link) is reported as not checked, and I will not "
+          "name an Azure object as the cause."),
+}
+
+
+def _read_gate_choice(value):
+    """`"retry"`, `"simple"`, or `""` for a reply to the read-access gate."""
+    v = _norm_ws(str(value or "")).strip().lower().strip("`.!?*\"'")
+    if not v:
+        return ""
+    depth = _read_depth(v)
+    if depth == "simple":
+        return "simple"
+    if depth == "deep" or any(t in v for t in _GATE_RETRY_TOKENS):
+        return "retry"
+    return ""
+
+
+def _apply_gate_choice(a):
+    """Fold the gate reply into the session. Called first in _normalize_answers.
+
+    `simple` parks the credential (so nothing downstream reads Azure with it) and sets
+    the depth; `retry` needs nothing — the stage re-runs the gate whenever it has not
+    passed. A `simple` that arrives under the depth key (the relay's natural guess) is
+    the same answer. An echo of the parked scope is not an upgrade; a NEW scope is.
+    """
+    gate_failed = (a.get(_SP_GATE) or {}).get("status") == "fail"
+    raw = a.pop("sp_gate", None)
+    a.pop(_SP_GATE_REPLY, None)
+    choice = _read_gate_choice(raw) if raw not in (None, "") else ""
+    if (not choice and gate_failed and not a.get(_SP_GATE_CHOICE)
+            and _read_depth(a.get("analysis_depth")) == "simple"):
+        choice = "simple"
+    if raw not in (None, "") or choice:
+        a[_SP_GATE_REPLY] = choice or "unparsed"
+    if choice == "simple" and gate_failed:
+        a[_SP_GATE_CHOICE] = "simple"
+        a["analysis_depth"] = "simple"
+        if a.get("sp_scope"):
+            a[_SP_SCOPE_PARKED] = a.pop("sp_scope")
+    if a.get(_SP_GATE_CHOICE) and a.get("sp_scope"):
+        if a["sp_scope"] == a.get(_SP_SCOPE_PARKED):
+            a.pop("sp_scope")
+        else:
+            for k in (_SP_GATE_CHOICE, _SP_GATE, _SP_SCOPE_PARKED):
+                a.pop(k, None)
+
+
+def _gate_key(a):
+    return "|".join(str(a.get(k) or "") for k in
+                    ("sp_scope", "workspace_arm_id", "storage_account", "storage_host"))
+
+
+def _gate_scope_phrase(a):
+    scopes = [m.get("scope") for m in ((a.get(_SP_GATE) or {}).get("missing") or [])]
+    if not scopes:
+        return "every Azure scope this diagnosis reads"
+    return ", ".join(f"`{x}`" for x in scopes[:4]) + (" and more" if len(scopes) > 4 else "")
+
+
+def _gate_commands(g):
+    """One Reader grant per missing scope — except a scope in ANOTHER Entra tenant, where
+    a Reader grant to this principal is not the fix (it does not exist there)."""
+    app = g.get("app_id") or "<application-id-of-the-service-principal>"
+    return [f"az role assignment create --role Reader --assignee {app} "
+            f"--scope {m.get('grant_scope') or m['scope']}" for m in (g.get("missing") or [])
+            if not m.get("other_tenant")]
+
+
+def _gate_simple_text(s):
+    """`simple` in words true for THIS run. On classic with no running cluster the probes
+    run in this notebook, not inside the customer's VNet — saying otherwise sells a
+    measurement the run will not take."""
+    a = s["answers"]
+    if (s["path"] == "A" and a.get("compute_type") == "classic"
+            and not _CLUSTER_ID_RE.match(str(a.get("cluster_id") or ""))):
+        return ("I test the network path from this notebook — not from inside your VNet, since "
+                "no running cluster was given to probe from — plus the Databricks-side "
+                "configuration. Every Azure layer (NSGs, routes, firewall, peering, private DNS, "
+                "private endpoints) is reported as not checked.")
+    return _GATE_SIMPLE_TEXT.get(s["path"], _GATE_SIMPLE_TEXT["A"])
+
+
+def _sp_gate_question(s, short=False):
+    a = s["answers"]
+    g = a.get(_SP_GATE) or {}
+    simple = _gate_simple_text(s)
+    if short:
+        return ("Sorry — I need one of two words. `retry` = I check the service principal's "
+                "access again (after Reader is granted on the scopes I listed). `simple` = I "
+                f"continue without reading Azure: {simple} Which one — `retry` or `simple`?")
+    scope_name = a.get("sp_scope") or a.get(_SP_SCOPE_PARKED) or "(your secret scope)"
+    lines = []
+    for m in g.get("missing") or []:
+        holds = "; ".join(m.get("holds") or []) or "resources this diagnosis reads"
+        ev = "; ".join(m.get("evidence") or [])
+        lines.append(f"- `{m['scope']}` — {holds}" + (f" ({ev})" if ev else "")
+                     + (" — this scope is in ANOTHER Entra tenant, so a Reader grant to this "
+                        "principal is not the fix: it does not exist there. Reading it takes a "
+                        "principal from that tenant." if m.get("other_tenant") else ""))
+    more = ("\n\nThese are the scopes I could see so far. Some of them hide what comes next "
+            "(for example where your routes send traffic), so once they are readable I "
+            "check again and may name the next layer too." if g.get("partial") else "")
+    if g.get("needs_storage_id"):
+        more += ("\n\nBecause this principal sees no subscription, also send me the storage "
+                 "account's resource id as `storage_arm_id` with your `retry` (Azure Portal > "
+                 "the storage account > Properties > Resource ID, it starts with "
+                 "/subscriptions/...), or grant Reader on the subscription that holds it.")
+    return (
+        "I stopped before diagnosing anything. The service principal in secret scope "
+        f"`{scope_name}` (application id `{g.get('app_id') or '?'}`) cannot read every part "
+        "of your Azure configuration that this diagnosis reads — and a route, firewall or "
+        "DNS zone it cannot see looks exactly like one that is not there, so any root cause "
+        "I named now could be wrong.\n\n"
+        "Missing read access — role needed: **Reader** (read-only):\n"
+        + "\n".join(lines) + more + "\n\n"
+        + (("To grant it, someone who can assign roles on those scopes (Owner or User Access "
+            "Administrator) runs:\n```\n" + "\n".join(_gate_commands(g)) + "\n```\n"
+            "A new role assignment can take a few minutes to apply.\n\n") if _gate_commands(g)
+           else "\n")
+        + 
+        "Then answer `retry` and I'll check the access again before diagnosing. Or answer "
+        f"`simple` and I'll continue without reading Azure: {simple}")
+
+
+def _emit_sp_gate(s, path):
+    """NEED_INPUT for a failed read-access gate, bounded on replies that do not answer."""
+    a = s["answers"]
+    g = a.get(_SP_GATE) or {}
+    reply = a.pop(_SP_GATE_REPLY, "")
+    counts = dict(a.get(_ASK_COUNTS) or {})
+    if s.get("_replied") and (a.get(_LAST_ASKED) or "") == "sp_gate" and reply not in ("retry", "simple"):
+        counts["sp_gate"] = int(counts.get("sp_gate") or 0) + 1
+        a[_ASK_COUNTS] = counts
+    a[_LAST_ASKED] = "sp_gate"
+    _save_session(s, path)
+    cmds = _gate_commands(g)
+    if int(counts.get("sp_gate") or 0) >= _MAX_UNANSWERED_ASKS:
+        print("[Doctor] Asked twice to choose `retry` or `simple` after the read-access gate "
+              "failed, and neither came back. STOPPING — no diagnosis exists to present.")
+        return _decorate({
+            "status": "ERROR", "session_path": path, "path": s["path"],
+            "error": "service principal cannot read every scope the diagnosis needs",
+            "next_step": "No cell to run. Relay the message below and stop.",
+            "sp_gate": {"missing": g.get("missing") or [], "commands": cmds},
+            "message": (
+                "I have not diagnosed anything: the service principal cannot read "
+                + _gate_scope_phrase(a) + ", and without those a root cause would be a guess. "
+                "Grant it Reader there and start again, or start again and answer `simple` "
+                "for the analysis that does not read Azure.\n```\n" + "\n".join(cmds) + "\n```"),
+        }, s["path"])
+    q = {"ids": ["sp_gate"] + (["cluster_id"] if s["path"] == "C" else [])
+         + (["storage_arm_id"] if g.get("needs_storage_id") else []),
+         "question": _sp_gate_question(s, short=bool(counts.get("sp_gate")))}
+    next_call = f"run_network_doctor(answers={{...}}, session_path=r'{path}')"
+    res = _decorate({"status": "NEED_INPUT", "session_path": path, "path": s["path"],
+                     "questions": [q],
+                     "sp_gate": {"missing": g.get("missing") or [], "commands": cmds,
+                                 "partial": bool(g.get("partial"))},
+                     "next_step": _safe_cell(next_call)}, s["path"])
+    print("[Doctor] NEED_INPUT — the service principal CANNOT READ every Azure scope this "
+          "diagnosis reads, so I STOPPED before diagnosing. There is NO finding and NO root "
+          "cause to present — do not offer one, and do not guess from the error text.")
+    print("[Doctor] RELAY this ONE question VERBATIM, including the scope list and the "
+          "commands (they are read-only Reader grants the CUSTOMER runs; you do not run them):")
+    print(f"[Doctor]   - {q['question']}")
+    for c in cmds:
+        print(f"[Doctor]   grant: {c}")
+    print(f"[Doctor] Then run this cell, LEADING with the safety comment exactly as shown:")
+    print(f"[Doctor]   {_SAFETY_PREAMBLE}")
+    print(f"[Doctor]   {next_call}  # fill: {{'sp_gate': 'retry'}} or {{'sp_gate': 'simple'}}")
+    return res
+
+
+def _run_sp_gate(s, path, tok, sp, list_dns_zones=False, extra=(), workspace_id=None):
+    """Run (or reuse) the read-access gate. Returns None to proceed, or a result to return.
+
+    A pass is cached against the credential + target, so a multi-turn run checks once; a
+    failure is never cached as final — every entry re-checks, which is what `retry` means.
+    """
+    a = s["answers"]
+    key = _gate_key(a)
+    prev = a.get(_SP_GATE) or {}
+    if prev.get("status") == "pass" and prev.get("key") == key:
+        a.pop(_SP_GATE_REPLY, None)
+        return None
+    learned = [tuple(x) for x in (a.get(_SP_GATE_EXTRA) or [])]
+    g = arm_read_gate(tok, (a.get("workspace_arm_id") or "") if workspace_id is None else workspace_id,
+                      list_dns_zones=list_dns_zones, extra=list(extra) + learned)
+    print(f"[Doctor] Service-principal read-access gate: {g['status'].upper()} — "
+          f"{len(g['checked'])} scope(s) checked"
+          + (f"; cannot read: {', '.join(m['scope'] for m in g['missing'])}" if g["missing"] else ""))
+    if g["status"] == "unreachable":
+        return "unreachable"
+    if g["status"] in ("error", "unverified"):
+        a.pop(_SP_GATE_REPLY, None)
+        _save_session(s, path)
+        if g["status"] == "error":
+            # A rejected TOKEN does not heal by waiting: the secret or the tenant is wrong.
+            msg = ("Azure rejected the service principal's token (HTTP 401) while I was checking "
+                   f"what it can read, so I have not diagnosed anything. Check the client secret "
+                   f"and tenant id stored in secret scope `{a.get('sp_scope') or '?'}` — an "
+                   "expired or rotated secret, or a tenant id that is not the one the service "
+                   "principal lives in, gives exactly this. This is not a role-assignment "
+                   "problem, so granting Reader would not help.")
+        else:
+            msg = ("I could not verify what the service principal can read in Azure "
+                   f"({g['reason']}). This is NOT a permissions finding, and I have not "
+                   "diagnosed anything. Azure was busy or failing; run me again in a minute.")
+        return _decorate({
+            "status": "ERROR", "session_path": path, "path": s["path"],
+            "error": f"could not verify the service principal's access: {g['reason']}",
+            "next_step": "No cell to run. Relay the message below and stop.",
+            "message": msg,
+        }, s["path"])
+    if g["status"] == "pass":
+        a[_SP_GATE] = {"status": "pass", "key": key, "checked": g["checked"],
+                       "app_id": (sp or {}).get("client_id", "")}
+        a.pop(_SP_GATE_REPLY, None)
+        _save_session(s, path)
+        return None
+    a[_SP_GATE] = {"status": "fail", "key": key, "missing": g["missing"],
+                   "partial": bool(g["partial"]), "app_id": (sp or {}).get("client_id", "")}
+    return _emit_sp_gate(s, path)
+
+
+def _gate_from_denials(s, path, sp, denials):
+    """The checks themselves hit a 403 the gate did not foresee. Discard what they found
+    (it was built on an unread scope) and stop exactly as the gate does."""
+    a = s["answers"]
+    by_scope = {}
+    for d in denials:
+        sc = d.get("scope") or ""
+        if not sc:
+            continue            # nothing grantable to name (a tenant-level call)
+        what = _denial_label(d.get("url", ""))
+        ent = by_scope.setdefault(sc, {"holds": [], "evidence": [], "other_tenant": False})
+        if what not in ent["holds"]:
+            ent["holds"].append(what)
+        ent["evidence"].append(f"HTTP {d.get('status')} reading {what} during the checks")
+        ent["other_tenant"] = ent["other_tenant"] or d.get("kind") == "tenant"
+    if not by_scope:
+        return None
+    learned = [list(x) for x in (a.get(_SP_GATE_EXTRA) or [])]
+    for sc, ent in by_scope.items():
+        acts = sorted({d.get("action") for d in denials
+                       if d.get("scope") == sc and d.get("action")})
+        item = [sc, ", ".join(ent["holds"]), acts or None]
+        if item not in learned:
+            learned.append(item)
+    a[_SP_GATE_EXTRA] = learned
+    a[_SP_GATE] = {"status": "fail", "key": _gate_key(a), "partial": True,
+                   "app_id": (sp or {}).get("client_id", ""),
+                   "missing": [{"scope": sc, "holds": e["holds"], "evidence": sorted(set(e["evidence"])),
+                                "other_tenant": e["other_tenant"]}
+                               for sc, e in sorted(by_scope.items())]}
+    print(f"[Doctor] The checks hit {len(denials)} permission refusal(s) the access gate had not "
+          "foreseen — DISCARDING this run's findings (they rest on unread scopes).")
+    return _emit_sp_gate(s, path)
+
+
+def _denial_label(url):
+    """`the firewallPolicies `afwp-1` (ruleCollectionGroups)` from a refused ARM URL —
+    the resource that was refused, not the last path segment (`ruleCollectionGroups`)."""
+    parts = [p for p in str(url or "").split("?", 1)[0].split("/") if p]
+    low = [p.lower() for p in parts]
+    if "providers" not in low:
+        return f"`{parts[-1] if parts else url}`"
+    i = low.index("providers")
+    segs = parts[i + 2:]                     # type, name, subtype, ...
+    if len(segs) < 2:
+        return f"`{parts[-1]}`"
+    sub = [x for k, x in enumerate(segs[2:]) if k % 2 == 0 and x.lower() != "providers"]
+    return f"the {segs[0]} `{segs[1]}`" + (f" ({'/'.join(sub)})" if sub else "")
+
+
+def _mint_for_gate(a):
+    """(sp, token, error) from the session's secret scope — the same reads the stages do."""
+    try:
+        sp = load_azure_sp_from_secrets(_get_dbutils(), _sp_refs(a))
+    except Exception as e:
+        return None, None, f"could not read the SP from secret scope '{a.get('sp_scope')}': {e}"
+    tok = get_arm_token(sp["tenant_id"], sp["client_id"], sp["client_secret"])
+    if tok["error"]:
+        return sp, None, f"ARM token mint failed: {tok['error']}"
+    return sp, tok["token"], ""
+
+
+def _cluster_id_for_c(s):
+    a = s["answers"]
+    cid = str(a.get("cluster_id") or "").strip()
+    if _CLUSTER_ID_RE.match(cid):
+        return cid
+    m = _re.search(r"\b([0-9]{4}-[0-9]{6}-[A-Za-z0-9_]{4,})\b", s.get("problem") or "")
+    return m.group(1) if m else ""
+
+
+def _cluster_state(cluster_id):
+    """The cluster's own record of why it stopped — Databricks workspace API, no Azure."""
+    if not cluster_id:
+        return {}
+    try:
+        import requests as _req
+        ws = get_workspace_context() or {}
+        base, tok = ws.get("workspace_url", ""), ws.get("token", "")
+        if not (base and tok):
+            return {"error": "this session has no workspace URL/token to read the cluster",
+                    "cluster_id_asked": cluster_id}
+        if not base.startswith("http"):
+            base = f"https://{base}"
+        h = {"Authorization": f"Bearer {tok}"}
+        r = _req.get(f"{base}/api/2.1/clusters/get", params={"cluster_id": cluster_id},
+                     headers=h, timeout=15)
+        if r.status_code != 200:
+            return {"error": f"clusters/get answered HTTP {r.status_code}",
+                    "cluster_id_asked": cluster_id}
+        c = r.json()
+        out = {"cluster_id": cluster_id, "state": c.get("state"),
+               "state_message": c.get("state_message", ""),
+               "termination_reason": c.get("termination_reason") or {}, "events": []}
+        e = _req.post(f"{base}/api/2.1/clusters/events", headers=h, timeout=15,
+                      json={"cluster_id": cluster_id, "order": "DESC", "limit": 10})
+        if e.status_code == 200:
+            out["events"] = [{"type": ev.get("type"), "details": ev.get("details")}
+                             for ev in (e.json().get("events") or [])]
+        return out
+    except Exception as e:
+        return {"error": f"could not read the cluster ({e.__class__.__name__})",
+                "cluster_id_asked": cluster_id}
+
+
 def _probe_plane_from_checkpoint(s):
     """"classic" once a probe row RECORDS that it ran in the VNet, else "".
 
@@ -3298,6 +3672,10 @@ def _arm_absent_reason(a):
     """
     if _sp_refs(a):
         return ""
+    if a.get(_SP_GATE_CHOICE) == "simple":
+        return ("the service principal could not read " + _gate_scope_phrase(a)
+                + ", and you chose the simple analysis — these layers were not read, rather "
+                  "than read and found wanting")
     if a.get(_CREDENTIAL_REFUSED):
         return ("the Azure credential was asked for and was not available, so the Azure "
                 "configuration was not read; re-running with the secret scope name settles "
@@ -3609,6 +3987,9 @@ def _stage_A(s, path):
     ctx = _ctx_for_A(s)
     nxt = f"run_network_doctor(session_path=r'{path}')"
     if s["stage"] == "ready":
+        gate = _gate_for_A(s, path)
+        if gate is not None:
+            return gate
         ckpt_path = s.get("checkpoint_path") or os.path.join(
             _session_dir(s.get("base_dir") or None),
             _re.sub(r"[^A-Za-z0-9._-]", "_", f"{host}_{port}") + ".ckpt.json")
@@ -3617,7 +3998,22 @@ def _stage_A(s, path):
         _save_session(s, path)
         return _emit_in_progress(s, path, nxt)
     if s["stage"] == "infra":
+        drain_arm_denials()
         continue_diagnosis(s["checkpoint_path"], ctx)
+        denials = drain_arm_denials()
+        stop = (_gate_from_denials(s, path, {"client_id": _sp_app_id(a)}, denials)
+                if denials and _sp_refs(a) else None)
+        if stop is not None:
+            # Built on a scope the SP could not read: discard it whole, and stop as the
+            # gate does. A retry starts the run again from the access check.
+            try:
+                if s.get("checkpoint_path") and os.path.exists(s["checkpoint_path"]):
+                    os.remove(s["checkpoint_path"])
+            except Exception:
+                pass
+            s["checkpoint_path"], s["stage"] = "", "ready"
+            _save_session(s, path)
+            return stop
         pending = [p for p in ("probes", "infra")
                    if p not in load_checkpoint(s["checkpoint_path"])["phases_done"]]
         if not pending:
@@ -3630,6 +4026,46 @@ def _stage_A(s, path):
         return offer
     report = finalize_diagnosis(s["checkpoint_path"], _ctx_for_A(s))
     return _present(s, path, report)
+
+def _sp_app_id(a):
+    """The SP's application (client) id, for the grant commands. Not a secret."""
+    known = (a.get(_SP_GATE) or {}).get("app_id")
+    if known:
+        return known
+    try:
+        return load_azure_sp_from_secrets(_get_dbutils(), _sp_refs(a)).get("client_id", "")
+    except Exception:
+        return ""
+
+
+def _gate_for_A(s, path):
+    """Path A's read-access gate: classic + a credential + the workspace ARM id.
+
+    Serverless reads ARM only for an Azure-resource TARGET, whose scope is not known
+    before the run, and classic without the ARM id has nothing to walk from; both rely on
+    the denial ledger alone. A credential or reachability problem is not this gate's
+    finding either — the infra phase already names those (secret unreadable, token
+    failed, ARM unreachable), so the gate stands aside and lets it.
+    """
+    a = s["answers"]
+    if (a.get("compute_type") != "classic" or not _sp_refs(a) or a.get("sp_declined")
+            or not str(a.get("workspace_arm_id") or "").startswith("/subscriptions/")):
+        return None
+    sp, tok, err = _mint_for_gate(a)
+    if err:
+        print(f"[Doctor] Read-access gate skipped ({err}) — the infra phase reports it.")
+        return None
+    probe = probe_arm_reachability(tok)
+    if not probe.get("ok"):
+        return None
+    gate = _run_sp_gate(s, path, tok, sp, list_dns_zones=True)
+    if isinstance(gate, dict) or gate is None:
+        if gate is None:
+            (a.get(_SP_GATE) or {}).setdefault("app_id", sp.get("client_id", ""))
+            _save_session(s, path)
+        return gate
+    return None
+
 
 def _emit_path_c_egress_blocked(s, path, reason):
     """ARM is unreachable from this runtime. There is NO offline snapshot: tell the
@@ -3680,25 +4116,43 @@ def _stage_C(s, path):
         print(f"[Doctor] ERROR: {msg}")
         return {"status": "ERROR", "session_path": path, "path": "C", "error": msg}
 
-    # No offline path any more. Before asking anyone for a credential, probe whether
-    # THIS runtime can reach management.azure.com AT ALL — that probe needs no token
-    # (a bare 401 proves the network path is open). If it can't, the deliverable is
-    # the egress to enable, not a snapshot and not a credential we can't use yet.
+    refs = _sp_refs(a)
+    if a.get(_SP_GATE_CHOICE) == "simple" or not refs or a.get("sp_declined"):
+        # No Azure read on this run: the customer chose `simple` at the read-access gate,
+        # or declined the credential. Both get the Databricks-only report, which makes NO
+        # ARM call and never names an Azure object as the cause. (The no-credential branch
+        # used to run the full diagnostic with an empty token: a raw HTTP 401 row in front
+        # of the customer, and the Azure correlation rules run on the error text alone.)
+        if a.get(_SP_GATE_CHOICE) == "simple":
+            reason = ("the service principal could not read " + _gate_scope_phrase(a)
+                      + ", and you chose the simple analysis")
+            _partial = bool((a.get(_SP_GATE) or {}).get("partial"))
+            fix = ["To get the cause: grant the service principal Reader on "
+                   + ("at least " if _partial else "") + _gate_scope_phrase(a)
+                   + (" (more may be named once those are readable)" if _partial else "")
+                   + " and run the diagnosis again — that run reads the Azure network and names "
+                     "the exact object and the change to make."]
+        else:
+            reason = "no Azure credential was provided"
+            fix = ["To get the cause: run the diagnosis again with a read-only (Reader) service "
+                   "principal — that run reads the Azure network and names the exact object and "
+                   "the change to make."]
+        print("[Doctor] Path C WITHOUT Azure reads — " + reason + ". Reporting what Databricks "
+              "recorded about the failed start; every Azure layer is NOT CHECKED, and no "
+              "Azure object is named as the cause.")
+        report = diagnose_cluster_start_databricks_only(
+            s["problem"], arm_id, cluster_state=_cluster_state(_cluster_id_for_c(s)),
+            not_checked_reason=reason, prescription=fix)
+        return _present(s, path, report)
+
+    # No offline path any more. Before using the credential, probe whether THIS runtime
+    # can reach management.azure.com AT ALL — that probe needs no token (a bare 401
+    # proves the network path is open). If it can't, the deliverable is the egress to
+    # enable, not a snapshot and not a credential we can't use yet.
     reach = probe_arm_reachability()
     if not reach.get("ok") and not reach.get("reachable"):
         return _emit_path_c_egress_blocked(
             s, path, reason=reach.get("reason", "no route to management.azure.com"))
-
-    refs = _sp_refs(a)
-    if not refs or a.get("sp_declined"):
-        # ARM is reachable but Path C reads the Azure config through a Reader SP and has
-        # no credential-free version. Say so — the intake SP ask (with its `create`
-        # walkthrough) is where they get one; a decline finalizes with the Azure layer
-        # honestly marked not inspected.
-        print("[Doctor] Path C needs a read-only Service Principal to inspect the Azure "
-              "config; none was provided. The Azure layer will be reported as NOT inspected.")
-        report = diagnose_cluster_start(s["problem"], arm_id, arm_token="")
-        return _present(s, path, report)
 
     try:
         sp = load_azure_sp_from_secrets(_get_dbutils(), refs)
@@ -3719,7 +4173,19 @@ def _stage_C(s, path):
     if not probe.get("ok") and not probe.get("reachable"):
         return _emit_path_c_egress_blocked(
             s, path, reason=probe.get("reason", "no route to management.azure.com"))
+    # BEFORE any check: can this SP read every scope the diagnosis reads?
+    gate = _run_sp_gate(s, path, tok["token"], sp, list_dns_zones="if_private")
+    if gate == "unreachable":
+        return _emit_path_c_egress_blocked(
+            s, path, reason="ARM stopped answering while the service principal's access was checked")
+    if gate is not None:
+        return gate
+    drain_arm_denials()
     report = diagnose_cluster_start(s["problem"], arm_id, arm_token=tok["token"])
+    denials = drain_arm_denials()
+    stop = _gate_from_denials(s, path, sp, denials) if denials else None
+    if stop is not None:
+        return stop
     return _present(s, path, report)
 
 
@@ -4023,6 +4489,11 @@ def _stage_B(s, path):
     # Without an SP we can only report the credential chain — be honest, do not guess RBAC/network.
     if a.get("sp_declined") or not _sp_refs(a):
         chain_traced = bool(table_info.get("storage_account"))
+        # The customer who chose `simple` at the read-access gate DID give a credential;
+        # telling them "no Azure SP provided" would be false. Say what actually happened.
+        _gated = a.get(_SP_GATE_CHOICE) == "simple"
+        _why = (("the service principal could not read " + _gate_scope_phrase(a))
+                if _gated else "no Azure SP provided")
         checks = [
             _target_check(target),
             CheckResult("Table / Credential Chain", fqdn,
@@ -4031,21 +4502,35 @@ def _stage_B(s, path):
                          f"access_connector={ac_id or '(unresolved)'}") if chain_traced else
                         ("Not traced — no Unity Catalog table resolved, so catalog / storage "
                          "credential / Access Connector are unknown for this target.")),
-            CheckResult("Storage Firewall", fqdn, Status.SKIP, "Skipped — no Azure SP provided (network not checked)."),
-            CheckResult("Network Security Perimeter", fqdn, Status.SKIP, "Skipped — no Azure SP provided."),
-            CheckResult("Storage Role Assignments", fqdn, Status.SKIP, "Skipped — no Azure SP provided (RBAC not checked)."),
+            CheckResult("Storage Firewall", fqdn, Status.SKIP, f"Skipped — {_why} (network not checked)."),
+            CheckResult("Network Security Perimeter", fqdn, Status.SKIP, f"Skipped — {_why}."),
+            CheckResult("Storage Role Assignments", fqdn, Status.SKIP, f"Skipped — {_why} (RBAC not checked)."),
         ]
-        diag = [Diagnosis(
-            pattern_id="storage_needs_sp", title="Cannot Determine Root Cause Without an Azure Reader SP",
-            severity=Severity.INFO, confidence="low",
-            root_cause=(("Traced the credential chain, but a" if chain_traced else "A")
-                        + " storage PERMISSION_DENIED can be RBAC OR a "
-                        "network block (firewall / NSP Learning / missing Resource Instance Rule). "
-                        "Without a Reader SP I can't read the storage network config or role assignments "
-                        "to tell which — so I won't guess."),
-            prescription=["Provide a Databricks-backed Reader SP (scope + key names) and re-run; I'll "
-                          "check firewall/NSP/Resource-Instance-Rule (network first) then RBAC."],
-            needs_confirmation=False, fix_order=1)] + _degraded_target_diagnosis(target)
+        if _gated:
+            diag = [Diagnosis(
+                pattern_id="storage_needs_sp",
+                title="Cannot Determine Root Cause — the Service Principal Cannot Read the Storage Side",
+                severity=Severity.INFO, confidence="low",
+                root_cause=(("Traced the credential chain, but a" if chain_traced else "A")
+                            + " storage PERMISSION_DENIED can be RBAC OR a network block "
+                            "(firewall / NSP Learning / missing Resource Instance Rule), and "
+                            f"{_why}, so I can't tell which — I won't guess."),
+                prescription=["Grant the service principal Reader on the scopes I listed and "
+                              "re-run with `deep`; I'll check firewall/NSP/Resource-Instance-Rule "
+                              "(network first) then RBAC."],
+                needs_confirmation=False, fix_order=1)] + _degraded_target_diagnosis(target)
+        else:
+            diag = [Diagnosis(
+                pattern_id="storage_needs_sp", title="Cannot Determine Root Cause Without an Azure Reader SP",
+                severity=Severity.INFO, confidence="low",
+                root_cause=(("Traced the credential chain, but a" if chain_traced else "A")
+                            + " storage PERMISSION_DENIED can be RBAC OR a "
+                            "network block (firewall / NSP Learning / missing Resource Instance Rule). "
+                            "Without a Reader SP I can't read the storage network config or role assignments "
+                            "to tell which — so I won't guess."),
+                prescription=["Provide a Databricks-backed Reader SP (scope + key names) and re-run; I'll "
+                              "check firewall/NSP/Resource-Instance-Rule (network first) then RBAC."],
+                needs_confirmation=False, fix_order=1)] + _degraded_target_diagnosis(target)
         return _present(s, path, build_storage_report(fqdn, checks, diag,
                         ("Credential chain traced; network/RBAC pending an Azure SP." if chain_traced
                          else f"Target {fqdn}; network/RBAC pending an Azure SP.")))
@@ -4058,10 +4543,84 @@ def _stage_B(s, path):
         return {"status": "ERROR", "session_path": path, "error": tok["error"]}
     # The ARM lookup keys on the ACCOUNT NAME, which we now have from the table OR
     # straight from the customer — the two are interchangeable here.
-    sa = find_storage_account_scope(tok, target["account"])
+    _sa_arm = str(a.get("storage_arm_id") or "").strip().rstrip("/")
+    _ws_sub = arm_scope_of(a.get("workspace_arm_id") or "").split("/resourceGroups/")[0]
+    if _sa_arm.startswith("/subscriptions/") and "/storageaccounts/" in _sa_arm.lower():
+        sa = {"scope": _sa_arm, "error": "", "searched": 1}
+    else:
+        sa = find_storage_account_scope(tok, target["account"],
+                                        subscription_ids=[_ws_sub.split("/")[-1]] if _ws_sub else ())
+    _subs_st = sa.get("subs_status")
+    if sa["error"] and _subs_st not in (None, 200):
+        # The subscription LIST itself failed. That says nothing about this principal's
+        # roles — a rejected token, throttling, a 5xx — so it must not become "you are not
+        # listed under any subscription, grant Reader".
+        if _subs_st == 401:
+            msg = ("Azure rejected the service principal's token (HTTP 401), so I have not "
+                   "diagnosed anything. Check the client secret and tenant id stored in secret "
+                   f"scope `{a.get('sp_scope') or '?'}`. This is not a role-assignment problem, "
+                   "so granting Reader would not help.")
+        else:
+            msg = (f"Azure answered HTTP {_subs_st} when I tried to locate storage account "
+                   f"`{target['account']}`, so I have not diagnosed anything. This is NOT a "
+                   "permissions finding; run me again in a minute.")
+        print(f"[Doctor] ERROR: {msg}")
+        return _decorate({"status": "ERROR", "session_path": path, "path": "B",
+                          "error": sa["error"], "message": msg,
+                          "next_step": "No cell to run. Relay the message below and stop."}, "B")
+    if sa["error"] and _subs_st == 200:
+        # The list ANSWERED and the account is in none of the subscriptions searched. The
+        # subscription list names only subscriptions where the principal holds a role AT
+        # subscription level or below — Reader on just the account's resource group in
+        # some OTHER subscription leaves that subscription out entirely, whether or not the
+        # principal is listed elsewhere. It may read the account perfectly well; it just
+        # cannot FIND it by name. Same stop as the gate, with the one fact that unblocks it
+        # — and, when other subscriptions WERE searched, the honest second possibility.
+        _listed = int(sa.get("listed") or 0)
+        _ev = ("this service principal is not listed under any Azure subscription, so I could "
+               "not even locate the account" if not _listed else
+               f"I searched the {sa.get('searched') or _listed} subscription(s) this principal "
+               "can list and the account is in none of them — it may sit in a subscription where "
+               "the principal holds only resource-group roles, or the account name may be wrong")
+        a[_SP_GATE] = {"status": "fail", "key": _gate_key(a), "partial": True,
+                       "app_id": sp.get("client_id", ""), "needs_storage_id": True,
+                       "missing": [{
+                           "scope": f"the storage account `{target['account']}`",
+                           "grant_scope": f"$(az storage account show --name {target['account']} --query id -o tsv)",
+                           "holds": ["its firewall, network perimeter and role assignments"],
+                           "evidence": [_ev]}]}
+        return _emit_sp_gate(s, path)
     if sa["error"]:
         print(f"[Doctor] ERROR locating storage account `{target['account']}` in ARM: {sa['error']}")
         return {"status": "ERROR", "session_path": path, "error": sa["error"]}
+
+    # BEFORE any storage read: can this SP read the account, its access connector and —
+    # on a classic consumer with the workspace ARM id — the egress path to it?
+    _classic_trace = (str(a.get("workspace_arm_id") or "").startswith("/subscriptions/")
+                      and a.get("compute_type", "").lower() == "classic")
+    _extra = [(sa["scope"], f"the storage account `{target['account']}` (its firewall, network "
+                            "perimeter and role assignments)")]
+    if ac_id:
+        _extra.append((ac_id, f"the access connector `{ac_id.rstrip('/').split('/')[-1]}`"))
+    gate = _run_sp_gate(s, path, tok, sp, list_dns_zones=False, extra=_extra,
+                        workspace_id=(a.get("workspace_arm_id") if _classic_trace else ""))
+    if gate == "unreachable":
+        # Not a permissions finding, and not something to read past: the storage checks
+        # would hit the same wall and report it as the account's own state.
+        msg = ("I can't reach Azure ARM (management.azure.com) from the compute I'm running "
+               "on, so I have NOT inspected the storage account. This is an EGRESS block, not "
+               "a permissions problem. Enable outbound HTTPS to `management.azure.com` and "
+               "`login.microsoftonline.com` from this compute (serverless: Account Console > "
+               "Settings > Network — the account network policy / NCC egress allow-list; "
+               "classic: the data-plane subnet's route table / NSG / hub firewall), then run me "
+               "again.")
+        print(f"[Doctor] ERROR (path B): Azure ARM became unreachable during the access check. {msg}")
+        return _decorate({"status": "ERROR", "session_path": path, "path": "B",
+                          "error": "ARM unreachable", "message": msg,
+                          "next_step": "No cell to run. Relay the message below and stop."}, "B")
+    if isinstance(gate, dict):
+        return gate
+    drain_arm_denials()
 
     fw = check_storage_firewall(tok, sa["scope"])
     # Pass the firewall result: the "no NSP" verdict depends on the account's topology
@@ -4146,6 +4705,10 @@ def _stage_B(s, path):
             recommendation=egress_trace.get("recommendation", ""),
             metadata={"egress_trace": True, **_gate}))
 
+    denials = drain_arm_denials()
+    stop = _gate_from_denials(s, path, sp, denials) if denials else None
+    if stop is not None:
+        return stop
     diagnoses = (_compose_storage_diagnosis(fqdn, fw, nsp, ac_in_rules, roles, ac_id,
                                             egress_trace=egress_trace,
                                             ac_info=target.get("ac_info"))
@@ -4165,6 +4728,8 @@ def _drive_network_doctor(problem_text="", answers=None, session_path="", base_d
     entry point and adds the crash guarantees (no raw traceback reaches the
     customer, and a cluster we provisioned is torn down).
     """
+    # No stage may inherit a refusal recorded by an earlier call in this kernel.
+    drain_arm_denials()
     if session_path:
         path = session_path
         s = _load_session(path)
@@ -4254,6 +4819,9 @@ def _drive_network_doctor(problem_text="", answers=None, session_path="", base_d
     # first turn — so the customer was asked for a compute type the driver could already
     # read from its own Spark conf (observed in the field).
     _normalize_answers(s)
+    # The read-access gate is asked from the stages, not the intake, so its bound needs
+    # to know whether THIS call carried a reply (a bare re-run is not a refusal).
+    s["_replied"] = bool(answers)
 
     if (s.get("path") == "C"
             and s["answers"].get("workspace_arm_declined")

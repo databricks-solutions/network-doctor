@@ -5,7 +5,28 @@ Quote it if you need help with a result.
 
 ## Unreleased
 
+### Added
+
+- **The tool checks it can read your Azure setup before it diagnoses.** On a deep run it
+  confirms the service principal can read every resource the diagnosis uses. If something is
+  missing it stops, with no diagnosis, and asks one question: which resources, what lives
+  there and why, and one read-only Reader command per resource. Answer `retry` once granted,
+  or `simple` to continue without reading Azure. Reader on the resource groups that cover
+  everything is enough; the subscription is read only where something is listed across it,
+  and the question says why. A connectivity run on a classic cluster always
+  needs read on the subscription, because private DNS zones are listed across it and a list
+  limited to some resource groups cannot show that no other zone exists.
+- **A cluster that will not start now has a Databricks-only report.** Choosing `simple` at that
+  question, or answering `none` to the credential, reads only your error text and the
+  cluster's termination reason and events from Databricks. Every Azure row says "Not checked"
+  and the diagnosis never blames an Azure object. Before, `none` produced a failed Azure read.
+
 ### Fixed
+
+- **An unreadable route table is no longer reported as clean.** "Outbound to www.databricks.com"
+  and "Forced-Tunnel Firewall Egress" now say "Not checked" instead of passing.
+- **The firewall and storage account are now found with Reader on resource groups only.** The
+  search always includes the workspace's subscription and each peered network's subscription.
 
 - **Installation now works as documented, entirely in the UI.** Genie Code loads a skill
   from a subfolder of a registered skills folder. With `SKILL.md` at the repository root, a

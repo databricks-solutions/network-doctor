@@ -1917,6 +1917,113 @@ def _diagnose_cluster_start_inner(nhc_error_text, workspace_resource_id, arm_tok
                                        workspace_url=workspace_url)
 
 
+# Every Azure row the full cluster-start diagnostic reads, in its order. The
+# Databricks-only report lists them ALL as not checked: a layer that is simply absent
+# from a report reads as "nothing wrong there".
+_CLUSTER_START_AZURE_ROWS = (
+    ("ws_network_cfg", "Workspace Network Config"),
+    ("ws_backend_private_link", "Back-end Private Link"),
+    ("subnet_delegation", "Subnet Delegation"),
+    ("subnet_nsg", "Subnet NSG Rules"),
+    ("subnet_routes", "Subnet Route Table"),
+    ("subnet_egress_ip", "Subnet Egress IP"),
+    ("ws_private_link", "Workspace Private Link"),
+    ("ws_private_dns", "Workspace Private DNS"),
+    ("forced_tunnel_firewall", "Forced-Tunnel Firewall Egress"),
+)
+
+
+def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id="",
+                                           cluster_state=None, not_checked_reason="",
+                                           prescription=None):
+    """Path C WITHOUT reading Azure: what Databricks itself recorded about the failed start.
+
+    The cluster-start diagnosis is decided in the customer's Azure network — NSGs, the
+    route table, a hub firewall, DNS, private link — and this builder reads none of it.
+    It makes NO ARM call. (The earlier no-credential branch called the full diagnostic
+    with an empty token, which put a raw "HTTP 401 AuthenticationFailedMissingToken" row
+    in front of the customer and still ran the Azure correlation rules on the NHC text.)
+
+    What it does read: the NHC / launch error text the customer gave, and — when the
+    driver could fetch it — the cluster's own termination reason and recent events. Every
+    Azure layer is an UNVERIFIED skip naming `not_checked_reason`, and the one diagnosis
+    says what failed in Databricks terms. It must never name an Azure object (an NSG, a
+    route, a firewall, a peering, a DNS zone, a private endpoint) as the cause: none was
+    read, and naming one is exactly the wrong answer the read-access gate exists to stop.
+    """
+    from models import Diagnosis, Severity
+    nhc = parse_nhc_error(nhc_error_text)
+    reason = (not_checked_reason or "no Azure credential was used, so the Azure network "
+              "configuration was not read")
+    target = (workspace_resource_id or "").rstrip("/").split("/")[-1] or "(cluster start)"
+    completed = {}
+    code = nhc.get("error_code") or ", ".join(nhc.get("launch_failure_signatures") or [])
+    completed["nhc_parse"] = CheckResult(
+        check_name="NHC Error Parse", target=code or "(unknown)",
+        status=Status.PASS if nhc.get("is_nhc") else Status.WARN,
+        message=(f"Parsed {code or 'no recognised error code'} ; "
+                 f"failed_components={nhc.get('failed_components') or []} ; "
+                 f"{len(nhc.get('entities') or [])} entity(ies)"),
+        metadata=nhc)
+    cs = cluster_state or {}
+    if cs.get("cluster_id"):
+        tr = cs.get("termination_reason") or {}
+        bits = [f"state={cs.get('state') or '?'}"]
+        if tr.get("code"):
+            bits.append(f"termination_reason={tr.get('code')} ({tr.get('type') or '?'})")
+        if cs.get("state_message"):
+            bits.append(f"\"{str(cs['state_message'])[:300]}\"")
+        for ev in (cs.get("events") or [])[:5]:
+            bits.append(f"event {ev.get('type')}: {str(ev.get('details') or '')[:160]}")
+        completed["cluster_termination"] = CheckResult(
+            check_name="Cluster Termination Reason", target=cs["cluster_id"],
+            status=Status.FAIL if tr.get("code") else Status.WARN,
+            message=" ; ".join(bits), metadata={"cluster_state": cs})
+    elif cs.get("error"):
+        completed["cluster_termination"] = CheckResult(
+            check_name="Cluster Termination Reason", target=cs.get("cluster_id_asked") or "(cluster)",
+            status=Status.SKIP, message=f"Not read — {cs['error']}",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED})
+    for key, label in _CLUSTER_START_AZURE_ROWS:
+        completed[key] = CheckResult(
+            check_name=label, target="(not read)", status=Status.SKIP,
+            message=f"Not checked — {reason}.",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED})
+
+    failed = ", ".join(nhc.get("failed_components") or [])
+    unreached = sorted({str(e.get("entity")) for e in (nhc.get("entities") or [])
+                        if e.get("entity") and str(e.get("outcome", "")).lower() not in ("success", "ok", "pass")})
+    evidence = [f"error code: {code}"] if code else []
+    if unreached:
+        evidence.append("endpoints the bootstrap could not reach: " + ", ".join(unreached[:8]))
+    if cs.get("termination_reason", {}).get("code"):
+        evidence.append(f"Databricks termination reason: {cs['termination_reason']['code']}")
+    what = ", ".join(x for x in (code, f"component: {failed}" if failed else "") if x)
+    # The FIRST sentence carries the whole verdict, because the chat keeps only that one:
+    # what failed, and that the layer deciding it was not read.
+    root = ("The cluster's start-up check failed" + (f" ({what})" if what else "")
+            + ", and the Azure network that decides this was not read on this run, so no "
+              "layer or object is named as the cause. "
+            + (f"The bootstrap could not reach {', '.join(unreached[:4])}. " if unreached else "")
+            + f"Not read because {reason}.")
+    diag = Diagnosis(
+        pattern_id="cluster_start_azure_not_checked",
+        title="Cluster start failed — the Azure network side was not checked",
+        # INFO + low confidence is the engine's "I could not conclude" (models.cannot_conclude):
+        # the cluster failing to start is the customer's report, not our finding, and a HIGH
+        # "Root cause" card would read as one.
+        severity=Severity.INFO, confidence="low", root_cause=root, evidence=evidence,
+        prescription=list(prescription or [
+            "Re-run with a read-only (Reader) service principal — that run reads the Azure "
+            "network and names the exact object and fix."]),
+        needs_confirmation=False, fix_order=1, layer="")
+    rows = dict(completed)
+    return DiagnosticReport(
+        target=target, host="", port=443, checks=rows, diagnoses=[diag], skipped=[],
+        overall_status=derive_overall_status(rows, [diag]),
+        summary=("Databricks-side read only: " + root))
+
+
 def _build_cluster_start_report(workspace_resource_id, completed, skipped, nhc,
                                  workspace_url=""):
     """Assemble the final report and run NHC correlation rules."""

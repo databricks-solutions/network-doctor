@@ -24,6 +24,7 @@ result = run_network_doctor(problem_text)
 Then follow `result["status"]` (every call also PRINTS the literal next action):
 
 - **NEED_INPUT** → relay `result["questions"]` to the customer in ONE chat message (no hypotheses, no diagnosis); when they answer, run `run_network_doctor(answers={...}, session_path=r'<printed>')` filling the question ids. SP credentials stay names-only — the doctor resolves them internally.
+- **NEED_INPUT with `sp_gate`** → the SP cannot read every Azure scope the deep run needs. Relay the question VERBATIM (scopes + `az role assignment create` commands), no diagnosis; reply `answers={'sp_gate': 'retry'|'simple'}` (Path C also `cluster_id`; Path B also `storage_arm_id` when the SP sees no subscription). `result["sp_gate"]` = `{missing, commands, partial}`.
 - **IN_PROGRESS** → run `result["next_step"]` in a NEW cell (one execution turn per phase; the session file survives resets — after a reset just repeat the same call, nothing re-runs).
 - **DONE** → present in this exact order: (0) if `result["confirmation_questions"]` is non-empty, ask them FIRST and present only the matching option; (1) post `result["chat_prescription"]` in chat; (2) NEW cell: `displayHTML(nd_render_dashboard(result["session_path"]))`; (3) post `result["dashboard_pointer"]` VERBATIM — never a sentence of your own, and never a claim that the dashboard rendered or is visible. This satisfies the global Finalize-Turn rule.
 - **ERROR** → the message says exactly what the customer must fix; relay it and re-call with corrected answers.
@@ -201,11 +202,13 @@ and one more ask with no scope name, after which the driver switches the run to 
 itself and says so — relay that, including what it leaves unverified, instead of presenting
 a reduced run as a complete one.
 
-Path C is never asked the depth question. Its diagnosis is read entirely from ARM, so
-there is no credential-free version: a customer with no Reader SP cannot have the Azure
-config inspected, and the report says so rather than guessing. There is no offline
-snapshot — the ARM config is read LIVE, or (if the runtime cannot reach ARM) the customer
-is told which egress to enable and to re-run.
+Path C is never asked the depth question at intake: its diagnosis is decided in Azure, so it
+starts deep. It does have a credential-free version, reached two ways — `simple` at the
+read-access gate (`sp_gate`), or `none` to the credential — and both give the Databricks-only
+report: the error text and the cluster's own termination reason and events, every Azure layer
+"Not checked", no Azure object named as the cause. There is no offline snapshot — the ARM
+config is read LIVE, or (if the runtime cannot reach ARM) the customer is told which egress
+to enable and to re-run.
 
 ### Scope-creation walkthrough (use when the customer has no Databricks-backed secret scope)
 

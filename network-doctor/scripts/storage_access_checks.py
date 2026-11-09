@@ -12,6 +12,7 @@ No pip dependencies beyond 'requests' (already available).
 import time
 
 from models import CheckResult, DiagnosticReport, Status, derive_overall_status
+from cluster_start_checks import record_arm_denial
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +498,8 @@ def resolve_access_connector_principal(arm_token, access_connector_id):
             headers={"Authorization": f"Bearer {arm_token}"},
             timeout=15,
         )
+        record_arm_denial(f"https://management.azure.com{access_connector_id}",
+                          resp.status_code, resp.text)
         if resp.status_code == 404:
             result["error"] = f"Access Connector not found at {access_connector_id}"
             return result
@@ -522,19 +525,25 @@ def resolve_access_connector_principal(arm_token, access_connector_id):
     return result
 
 
-def find_storage_account_scope(arm_token, storage_account_name):
+def find_storage_account_scope(arm_token, storage_account_name, subscription_ids=()):
     """Find a storage account's ARM scope by searching across accessible subscriptions.
 
     Args:
         arm_token: Azure ARM bearer token
         storage_account_name: Storage account name (e.g. "mystorage")
+        subscription_ids: subscriptions to search IN ADDITION to the listed ones. The
+            subscription list names only subscriptions where the principal holds a role
+            at or below subscription level — an SP with Reader on just the storage
+            account's resource group is listed under none, and the search used to give
+            up having searched zero subscriptions.
 
     Returns:
-        dict with keys: scope, subscription_id, resource_group, location, error
+        dict with keys: scope, subscription_id, resource_group, location, error, searched
     """
     import requests as _req
 
-    result = {"scope": "", "subscription_id": "", "resource_group": "", "location": "", "error": ""}
+    result = {"scope": "", "subscription_id": "", "resource_group": "", "location": "",
+              "error": "", "searched": 0, "listed": None, "subs_status": None}
     headers = {"Authorization": f"Bearer {arm_token}"}
 
     try:
@@ -543,11 +552,17 @@ def find_storage_account_scope(arm_token, storage_account_name):
             "https://management.azure.com/subscriptions?api-version=2020-01-01",
             headers=headers, timeout=15,
         )
+        result["subs_status"] = subs_resp.status_code
         if subs_resp.status_code != 200:
             result["error"] = f"Could not list subscriptions: HTTP {subs_resp.status_code}"
             return result
 
         subscriptions = subs_resp.json().get("value", [])
+        result["listed"] = len(subscriptions)
+        _listed = {x.get("subscriptionId", "") for x in subscriptions}
+        subscriptions = subscriptions + [{"subscriptionId": x} for x in subscription_ids
+                                         if x and x not in _listed]
+        result["searched"] = len(subscriptions)
 
         for sub in subscriptions:
             sub_id = sub.get("subscriptionId", "")
@@ -613,6 +628,7 @@ def check_storage_roles(arm_token, scope, principal_id):
             headers={"Authorization": f"Bearer {arm_token}"},
             timeout=15,
         )
+        record_arm_denial(url, resp.status_code, resp.text)
         if resp.status_code == 403:
             return CheckResult(
                 "Storage Role Assignments", target, Status.ERROR,
@@ -726,6 +742,7 @@ def check_storage_firewall(arm_token, scope):
             headers={"Authorization": f"Bearer {arm_token}"},
             timeout=15,
         )
+        record_arm_denial(f"https://management.azure.com{scope}", resp.status_code, resp.text)
         if resp.status_code == 403:
             return CheckResult(
                 "Storage Firewall", target, Status.ERROR,
@@ -958,6 +975,7 @@ def check_storage_nsp(arm_token, scope, firewall=None):
             headers={"Authorization": f"Bearer {arm_token}"},
             timeout=15,
         )
+        record_arm_denial(url, resp.status_code, resp.text)
 
         # NSP API may return 404 if no NSP feature or no association
         if resp.status_code == 404:

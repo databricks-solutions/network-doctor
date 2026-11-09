@@ -16,7 +16,7 @@ import ipaddress as _ipaddress
 import re as _re
 import time as _time
 
-from models import CheckResult, Status
+from models import CheckResult, Status, SKIP_KIND_META, SKIP_UNVERIFIED
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +306,7 @@ def parse_nhc_error(error_text):
 # this runtime cannot reach ARM, the caller tells the customer exactly which
 # egress to enable and to re-run — it never diagnoses from a file.
 
-def _arm_get(arm_token, url, params=None, timeout=15):
+def _arm_get(arm_token, url, params=None, timeout=15, record=True):
     """GET an ARM URL LIVE against management.azure.com.
 
     There is no offline/snapshot mode: the whole point is to read the customer's
@@ -314,16 +314,418 @@ def _arm_get(arm_token, url, params=None, timeout=15):
     If this runtime cannot reach ARM (serverless egress blocked / NCC default-deny),
     the caller does NOT fall back to a pre-fetched file — it tells the customer to
     enable egress to management.azure.com and re-run, so the diagnosis stays live.
+
+    A denied read is recorded in the denial ledger (see arm_read_gate). `record=False`
+    is for SEARCHES only — enumerating candidate subscriptions, where a 403 on one that
+    has nothing to do with this workspace must not stop the run.
     """
     import requests as _req
     headers = {"Authorization": f"Bearer {arm_token}"}
     try:
         r = _req.get(url, headers=headers, params=params or {}, timeout=timeout)
         if r.status_code != 200:
-            return {"_error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            if record:
+                record_arm_denial(url, r.status_code, r.text)
+            return {"_error": f"HTTP {r.status_code}: {r.text[:200]}", "_status": r.status_code}
         return r.json()
     except Exception as e:
-        return {"_error": f"request failed: {e}"}
+        return {"_error": f"request failed: {e}", "_status": 0}
+
+
+# ---------------------------------------------------------------------------
+# The read-access gate
+# ---------------------------------------------------------------------------
+#
+# A service principal that can read SOME of the customer's network is more dangerous
+# than one that can read none of it. Every ARM idiom here turns a 403 into "nothing
+# there": `_arm_get` returns an error dict the caller reads as a missing route table,
+# and a subscription-wide LIST answers 200 with the unreadable resource groups simply
+# filtered out. So a hub firewall the SP cannot see looked like a third-party NVA, and a
+# private DNS zone in an unreadable resource group looked like no zone at all — a
+# confident root cause built on data that was never read.
+#
+# Two layers, because neither alone covers every producer:
+#   1. arm_read_gate() — BEFORE any check: walk the scopes this diagnosis reads (the
+#      workspace, its VNet, the subnets' NSG / route table / NAT, peered VNets, the hub
+#      firewall and its policy, private endpoints, and the subscription wherever a
+#      subscription-wide list runs) and verify read at each one.
+#   2. the denial ledger — DURING the checks: every ARM GET helper records a 403 here,
+#      so a scope first met mid-run (a policy in a third resource group) still stops the
+#      run instead of shaping a verdict. The caller drains it after the checks and
+#      discards the report if anything was denied.
+
+_ARM_DENIALS = []
+
+
+def arm_scope_of(url_or_id):
+    """The grantable scope that holds an ARM URL or id: its resource group, else its
+    subscription. "" when there is none (tenant-level calls, a non-ARM URL)."""
+    s = str(url_or_id or "").split("?", 1)[0]
+    if "management.azure.com" in s:
+        s = s.split("management.azure.com", 1)[1]
+    parts = [p for p in s.split("/") if p]
+    low = [p.lower() for p in parts]
+    if "subscriptions" not in low:
+        return ""
+    i = low.index("subscriptions")
+    if i + 1 >= len(parts):
+        return ""
+    scope = f"/subscriptions/{parts[i + 1]}"
+    if "resourcegroups" in low:
+        j = low.index("resourcegroups")
+        if j + 1 < len(parts):
+            scope += f"/resourceGroups/{parts[j + 1]}"
+    return scope
+
+
+def arm_denial_kind(status, body=""):
+    """Is this ARM answer a PERMISSION fact? "denied" (an RBAC refusal), "tenant" (the
+    scope lives in another Entra tenant), or "" (anything else — throttling, a 5xx, a
+    proxy's 403 page). Only the first two may ever become "grant Reader": telling a
+    customer to change RBAC because ARM was busy would send them to the wrong blade."""
+    b = str(body or "")
+    if status == 403 and ("AuthorizationFailed" in b or "LinkedAuthorizationFailed" in b):
+        return "denied"
+    if status == 401 and "InvalidAuthenticationTokenTenant" in b:
+        return "tenant"
+    if status == 404 and "SubscriptionNotFound" in b:
+        # A subscription this principal holds no role in can answer "not found" rather
+        # than 403. Skipping it as a missing RESOURCE would wave a peered hub through.
+        return "nosub"
+    return ""
+
+
+def arm_read_action(url_or_id):
+    """The RBAC read action an ARM GET needs, from its URL:
+    `.../providers/Microsoft.Network/firewallPolicies/p/ruleCollectionGroups` ->
+    `Microsoft.Network/firewallPolicies/ruleCollectionGroups/read`."""
+    s = str(url_or_id or "").split("?", 1)[0]
+    parts = [p for p in s.split("/") if p]
+    low = [p.lower() for p in parts]
+    if "providers" not in low:
+        return ""
+    i = len(low) - 1 - low[::-1].index("providers")
+    segs = parts[i + 1:]
+    if len(segs) < 2:
+        return ""
+    return "/".join([segs[0]] + segs[1::2]) + "/read"
+
+
+def record_arm_denial(url, status, body=""):
+    """Remember an ARM permission refusal. Every ARM GET helper calls this on a non-200;
+    only a real RBAC refusal (arm_denial_kind) is kept."""
+    kind = arm_denial_kind(status, body)
+    if not kind or "management.azure.com" not in str(url or ""):
+        return
+    _ARM_DENIALS.append({"url": str(url).split("?", 1)[0], "scope": arm_scope_of(url),
+                         "status": status, "kind": kind, "action": arm_read_action(url),
+                         "detail": str(body or "")[:200]})
+
+
+def drain_arm_denials():
+    """Return and clear every 403 recorded since the last drain."""
+    out = list(_ARM_DENIALS)
+    del _ARM_DENIALS[:]
+    return out
+
+
+# Read actions per resource type the diagnosis reads. Kept to actions that exist, so a
+# custom role that lists them precisely passes; Reader's `*/read` covers all of them.
+_GATE_READS = {
+    "workspaces": ["Microsoft.Databricks/workspaces/read"],
+    "virtualnetworks": ["Microsoft.Network/virtualNetworks/read",
+                        "Microsoft.Network/virtualNetworks/subnets/read",
+                        "Microsoft.Network/virtualNetworks/virtualNetworkPeerings/read"],
+    "networksecuritygroups": ["Microsoft.Network/networkSecurityGroups/read"],
+    "routetables": ["Microsoft.Network/routeTables/read"],
+    "natgateways": ["Microsoft.Network/natGateways/read",
+                    "Microsoft.Network/publicIPAddresses/read"],
+    "azurefirewalls": ["Microsoft.Network/azureFirewalls/read"],
+    "firewallpolicies": ["Microsoft.Network/firewallPolicies/read",
+                         "Microsoft.Network/firewallPolicies/ruleCollectionGroups/read"],
+    "privateendpoints": ["Microsoft.Network/privateEndpoints/read"],
+    "storageaccounts": ["Microsoft.Storage/storageAccounts/read",
+                        "Microsoft.Authorization/roleAssignments/read"],
+    "accessconnectors": ["Microsoft.Databricks/accessConnectors/read"],
+}
+_GATE_SUB_DNS = ["Microsoft.Network/privateDnsZones/read",
+                 "Microsoft.Network/privateDnsZones/virtualNetworkLinks/read"]
+_GATE_SUB_TAGS = ["Microsoft.Network/locations/serviceTagDetails/read"]
+_GATE_SUB_FIREWALLS = ["Microsoft.Network/azureFirewalls/read"]
+_AV_PERMS = "2022-04-01"
+_AV_GATE_NET = "2023-02-01"
+_AV_GATE_FW = "2023-09-01"
+
+
+def _action_glob(pattern, action):
+    rx = "^" + _re.escape(str(pattern).lower()).replace(r"\*", ".*") + "$"
+    return _re.match(rx, str(action).lower()) is not None
+
+
+def actions_allowed(permissions, actions):
+    """Which of `actions` the Microsoft.Authorization/permissions `value` list grants.
+
+    Azure's own rule: an action is allowed when, within ONE permission entry (one role
+    assignment), some `actions` pattern matches it and no `notActions` pattern does.
+    Entries are OR'd. Returns the set of allowed actions.
+    """
+    allowed = set()
+    for act in actions:
+        for entry in permissions or []:
+            if (any(_action_glob(p, act) for p in (entry.get("actions") or []))
+                    and not any(_action_glob(p, act) for p in (entry.get("notActions") or []))):
+                allowed.add(act)
+                break
+    return allowed
+
+
+def _type_of(resource_id):
+    parts = [p for p in str(resource_id or "").split("/") if p]
+    low = [p.lower() for p in parts]
+    if "providers" in low:
+        i = len(low) - 1 - low[::-1].index("providers")
+        if i + 2 < len(parts):
+            return low[i + 2]
+    return ""
+
+
+def _short(resource_id):
+    return str(resource_id or "").rstrip("/").split("/")[-1]
+
+
+def arm_read_gate(arm_token, workspace_resource_id="", list_dns_zones=False, extra=None):
+    """Can this SP READ every Azure scope the diagnosis is about to read?
+
+    Walks the workspace's network the way the checks will — workspace, VNet, the
+    data-plane subnets' NSG / route table / NAT gateway, Connected peerings, the hub
+    firewall the 0.0.0.0/0 route points at and its policy, the workspace's private
+    endpoints — and asks ARM at each resource what this caller may do there
+    (`{id}/providers/Microsoft.Authorization/permissions`). Measured live: with no role
+    that endpoint answers 200 with an EMPTY list (never 403), and a subscription-wide
+    list answers 200 with the unreadable groups filtered out, so neither "the call
+    worked" nor "the list came back" proves access — only the permission list does.
+
+    A read counts when the permission list grants it AND no GET there came back 403 (a
+    deny assignment does not show in the permission list). The subscription itself is
+    required only for what is read ACROSS it: private DNS zones (`list_dns_zones`),
+    service-tag ranges (a drop route exists), and Azure Firewalls when a forced-tunnel
+    next hop could not be pinned to a firewall resource. `extra` is (resource_id, holds)
+    pairs the caller knows the run reads (Path B's storage account, an earlier run's
+    ledger).
+
+    Returns {"status": "pass" | "fail" | "unverified" | "unreachable" | "error",
+             "missing": [{"scope", "holds", "evidence"}], "unverified": [...],
+             "partial": bool, "checked": [...], "reason": str}.
+    `partial` means a refusal cut the walk short, so more scopes may follow once these
+    are readable. "unverified" (throttled / 5xx after a retry) is NOT a permission fact.
+    """
+    drain_arm_denials()
+    need = {}         # resource id or subscription -> {"actions", "holds", "group"}
+    denied = {}       # grantable scope -> [evidence]
+    lacking = {}      # (grantable scope, why) -> actions the permission list does not grant
+    tenants = set()   # scopes in ANOTHER Entra tenant: a Reader grant command cannot fix those
+    out = {"status": "pass", "missing": [], "unverified": [], "partial": False,
+           "checked": [], "reason": ""}
+
+    def _need(rid, holds, actions=None, group="", discovered=True):
+        if not rid:
+            return
+        n = need.setdefault(rid, {"actions": set(), "holds": [], "group": group or arm_scope_of(rid),
+                                  "discovered": discovered})
+        n["actions"].update(actions if actions is not None else _GATE_READS.get(_type_of(rid), []))
+        if holds and holds not in n["holds"]:
+            n["holds"].append(holds)
+
+    def _fetch(url):
+        body = _arm_get(arm_token, url, record=False)
+        st = body.get("_status", 200) if isinstance(body, dict) and "_error" in body else 200
+        if st == 429 or st >= 500:
+            _time.sleep(2)
+            body = _arm_get(arm_token, url, record=False)
+            st = body.get("_status", 200) if isinstance(body, dict) and "_error" in body else 200
+        if st == 0:
+            raise _GateUnreachable(body.get("_error", "no response from management.azure.com"))
+        return st, body
+
+    def _get(rid, av, what, suffix=""):
+        st, body = _fetch(f"https://management.azure.com{rid}{suffix}?api-version={av}")
+        if st == 200:
+            return body
+        kind = arm_denial_kind(st, body.get("_error", ""))
+        if kind:
+            out["partial"] = True
+            denied.setdefault(arm_scope_of(rid), []).append(
+                f"HTTP {st} reading {what}" + {"tenant": " — it is in another Entra tenant",
+                                                "nosub": " — this principal cannot see that subscription"}.get(kind, ""))
+            if kind == "tenant":
+                tenants.add(arm_scope_of(rid))
+        elif st == 429 or st >= 500:
+            out["unverified"].append(f"{what}: ARM answered HTTP {st} twice")
+        return None
+
+    try:
+        ws_id = str(workspace_resource_id or "").strip()
+        if ws_id.startswith("/subscriptions/"):
+            sub = arm_scope_of(ws_id).split("/resourceGroups/")[0]
+            _need(ws_id, f"the Databricks workspace `{_short(ws_id)}`", discovered=False)
+            ws = _get(ws_id, _AV_GATE_NET, f"the workspace `{_short(ws_id)}`")
+            props = (ws or {}).get("properties") or {}
+            params = props.get("parameters") or {}
+            vnet_id = (params.get("customVirtualNetworkId") or {}).get("value", "")
+            if list_dns_zones is True or (list_dns_zones == "if_private"
+                                          and props.get("publicNetworkAccess") == "Disabled"):
+                _need(sub, "private DNS zones — I list them across the whole subscription, and "
+                           "a list filtered to the resource groups this principal can read cannot "
+                           "prove no other zone exists (a zone it cannot see would look like no "
+                           "zone at all), so Reader on resource groups alone cannot settle this "
+                           "one", _GATE_SUB_DNS, group=sub)
+            for pe in backend_pe_ids_read(props.get("privateEndpointConnections")):
+                _need(pe, f"the workspace's back-end private endpoint `{_short(pe)}`")
+            nva_ips, rt_ids, attached = set(), [], {}
+            if vnet_id:
+                _need(vnet_id, f"the workspace VNet `{_short(vnet_id)}`")
+                if list_dns_zones is True:
+                    # Path A also LISTS the private endpoints of the VNet's resource group
+                    # and reads their NICs; a filtered list there is "no PE".
+                    _need(arm_scope_of(vnet_id), f"the private endpoints in the VNet's resource "
+                                                 f"group", ["Microsoft.Network/privateEndpoints/read",
+                                                            "Microsoft.Network/networkInterfaces/read"])
+                for sname in [(params.get(k) or {}).get("value", "")
+                              for k in ("customPublicSubnetName", "customPrivateSubnetName")]:
+                    if not sname:
+                        continue
+                    sn = _get(vnet_id, _AV_GATE_NET, f"subnet `{sname}`", suffix=f"/subnets/{sname}")
+                    sp = (sn or {}).get("properties") or {}
+                    for key, label in (("networkSecurityGroup", "network security group"),
+                                       ("routeTable", "route table"), ("natGateway", "NAT gateway")):
+                        rid = (sp.get(key) or {}).get("id", "")
+                        if rid:
+                            attached.setdefault(rid, [label, []])[1].append(sname)
+                        if key == "routeTable" and rid and rid not in rt_ids:
+                            rt_ids.append(rid)
+                # One line per resource, however many subnets share it.
+                for rid, (label, names) in attached.items():
+                    _need(rid, f"the {label} `{_short(rid)}` on subnet"
+                               + ("s " if len(names) > 1 else " ")
+                               + ", ".join(f"`{n}`" for n in names))
+                for rt_id in rt_ids:
+                    rt = _get(rt_id, _AV_GATE_NET, f"the route table `{_short(rt_id)}`")
+                    for r in ((rt or {}).get("properties") or {}).get("routes") or []:
+                        rp = r.get("properties") or {}
+                        if rp.get("nextHopType") == "VirtualAppliance" and rp.get("nextHopIpAddress"):
+                            nva_ips.add(rp["nextHopIpAddress"])
+                        if rp.get("nextHopType") == "None":
+                            _need(sub, "Azure service-tag ranges — read at subscription level to "
+                                       "decide whether a drop route covers a destination your "
+                                       "clusters need", _GATE_SUB_TAGS, group=sub)
+                peers = _get(vnet_id, _AV_GATE_NET, f"the peerings of `{_short(vnet_id)}`",
+                             suffix="/virtualNetworkPeerings")
+                fw_found = False
+                for p in (peers or {}).get("value") or []:
+                    pp = p.get("properties") or {}
+                    rv = (pp.get("remoteVirtualNetwork") or {}).get("id", "")
+                    if pp.get("peeringState") != "Connected" or not rv:
+                        continue
+                    _need(rv, f"the peered VNet `{_short(rv)}`",
+                          ["Microsoft.Network/virtualNetworks/read"])
+                    hub = _get(rv, _AV_GATE_NET, f"the peered VNet `{_short(rv)}`")
+                    if not nva_ips or not hub:
+                        continue
+                    for sn in (hub.get("properties") or {}).get("subnets") or []:
+                        if str(sn.get("name", "")).lower() != "azurefirewallsubnet":
+                            continue
+                        for ic in (sn.get("properties") or {}).get("ipConfigurations") or []:
+                            icid = str(ic.get("id", ""))
+                            cut = icid.lower().find("/azurefirewallipconfigurations/")
+                            if "/azurefirewalls/" not in icid.lower() or cut < 0:
+                                continue
+                            fw_id = icid[:cut]
+                            fw_found = True
+                            _need(fw_id, f"the Azure Firewall `{_short(fw_id)}` your routes send "
+                                         "traffic to")
+                            fw = _get(fw_id, _AV_GATE_FW, f"the Azure Firewall `{_short(fw_id)}`")
+                            pol = (((fw or {}).get("properties") or {}).get("firewallPolicy")
+                                   or {}).get("id", "")
+                            _need(pol, f"the firewall policy `{_short(pol)}` (its allow rules)")
+                if nva_ips and not fw_found and not out["partial"]:
+                    _need(sub, "Azure Firewalls — I list them across the subscription to find "
+                               f"the one at your route's next hop ({', '.join(sorted(nva_ips))})",
+                          _GATE_SUB_FIREWALLS, group=sub)
+        for item in extra or []:
+            rid, holds = item[0], item[1]
+            _need(rid, holds, (item[2] or None) if len(item) > 2 else None, discovered=False)
+
+        # Ask ARM, at each resource, what this caller may do there.
+        for rid, n in need.items():
+            if not n["actions"]:
+                continue
+            st, perms = _fetch(f"https://management.azure.com{rid}/providers/"
+                               f"Microsoft.Authorization/permissions?api-version={_AV_PERMS}")
+            kind = arm_denial_kind(st, perms.get("_error", "")) if st != 200 else ""
+            if st == 404 and not kind:
+                if not n["discovered"]:
+                    continue    # an id the customer gave that does not exist: the check says so
+                # Every DISCOVERED id comes from a live reference Azure keeps consistent — an
+                # NSG / route table / NAT gateway attached to the subnet (Azure refuses to
+                # delete one while attached), the remote VNet of a CONNECTED peering, a
+                # firewall named by its own ipConfiguration, the policy that firewall uses, a
+                # private endpoint the workspace lists as connected. So "not found" there is
+                # not a vanished resource; it is how ARM can answer a principal with no role in
+                # that subscription. Skipping it waved a cross-subscription hub through.
+                kind = "nosub"
+            if st == 404 and kind == "nosub" and n["discovered"]:
+                out["partial"] = True
+                denied.setdefault(n["group"], []).append(
+                    "Azure answered \"not found\" for a resource your configuration references — "
+                    "the shape of a subscription this principal cannot see")
+                continue
+            if st == 401 and not kind:
+                out.update(status="error", reason=f"ARM rejected the token (HTTP 401) while "
+                                                  f"checking access at {rid}")
+                return out
+            if st != 200 and not kind:
+                out["unverified"].append(f"access at `{rid}`: ARM answered HTTP {st}")
+                continue
+            out["checked"].append(rid)
+            missing = sorted(n["actions"] - (actions_allowed(perms.get("value"), n["actions"])
+                                             if st == 200 else set()))
+            if missing:
+                denied.setdefault(n["group"], [])
+                why = ("no read permission here" if st == 200 else
+                       "it is in another Entra tenant" if kind == "tenant" else
+                       "this principal cannot see that subscription" if kind == "nosub" else
+                       f"HTTP {st} on the access check")
+                if kind == "tenant":
+                    tenants.add(n["group"])
+                lacking.setdefault((n["group"], why), set()).update(missing)
+    except _GateUnreachable as e:
+        drain_arm_denials()
+        out.update(status="unreachable", reason=str(e))
+        return out
+    drain_arm_denials()
+    for (group, why), acts in lacking.items():
+        denied[group].append(f"{why}: {', '.join(sorted(acts))}")
+
+    for scope in sorted(denied):
+        holds = []
+        for rid, n in need.items():
+            if n["group"] == scope:
+                holds.extend(h for h in n["holds"] if h not in holds)
+        out["missing"].append({"scope": scope, "holds": holds,
+                               "evidence": sorted(set(denied[scope])),
+                               "other_tenant": scope in tenants})
+    if out["missing"]:
+        out["status"] = "fail"
+        out["reason"] = (f"the service principal cannot read {len(out['missing'])} of the "
+                         "Azure scopes this diagnosis reads")
+    elif out["unverified"]:
+        out["status"] = "unverified"
+        out["reason"] = "ARM did not answer every access check: " + "; ".join(out["unverified"])
+    return out
+
+
+class _GateUnreachable(Exception):
+    pass
 
 
 def probe_arm_reachability(arm_token="", timeout=5):
@@ -1530,6 +1932,40 @@ def _resolve_pe_vnet(arm_token, pe_id):
     return vnet, ""
 
 
+def _pe_group_ids(pe_props):
+    """The sub-resource(s) a workspace private-endpoint connection serves."""
+    gids = pe_props.get("groupIds") or []
+    if not gids:
+        plsc = pe_props.get("privateLinkServiceConnectionState", {}) or {}
+        for v in (pe_props.get("groupId"), plsc.get("groupId")):
+            if v:
+                gids = [v]
+                break
+    return [str(g) for g in gids]
+
+
+def _backend_pe_is_read(pe_props):
+    """THE rule for which workspace private-endpoint connections check_backend_private_link
+    reads: an Approved `databricks_ui_api` connection. The check and the read gate both
+    decide through this one predicate, so the gate can never demand access to a PE no
+    check reads (a Rejected request from someone else's subscription, a
+    browser_authentication PE in a transit one) — nor miss one the check starts reading."""
+    if not any("databricks_ui_api" in g for g in _pe_group_ids(pe_props)):
+        return False
+    return ((pe_props.get("privateLinkServiceConnectionState", {}) or {}).get("status", "")) == "Approved"
+
+
+def backend_pe_ids_read(pe_conns):
+    """Ids of the workspace private endpoints check_backend_private_link reads."""
+    out = []
+    for pe in pe_conns or []:
+        props = (pe or {}).get("properties", {}) or {}
+        pid = (props.get("privateEndpoint") or {}).get("id", "")
+        if pid and _backend_pe_is_read(props):
+            out.append(pid)
+    return out
+
+
 def check_backend_private_link(workspace_network_cfg, vnet_id, arm_token=""):
     """Detect a back-end (classic compute plane) Private Link connection.
 
@@ -1546,20 +1982,11 @@ def check_backend_private_link(workspace_network_cfg, vnet_id, arm_token=""):
     target = workspace_network_cfg.get("workspace_url", "")
     pe_conns = workspace_network_cfg.get("private_endpoint_connections", []) or []
 
-    def _group_ids(pe_props):
-        gids = pe_props.get("groupIds") or []
-        if not gids:
-            plsc = pe_props.get("privateLinkServiceConnectionState", {}) or {}
-            for v in (pe_props.get("groupId"), plsc.get("groupId")):
-                if v:
-                    gids = [v]
-                    break
-        return [str(g) for g in gids]
-
     ui_api_pes = []  # (name, state, pe_id, rg_heuristic_in_vnet)
+    approved = []    # the ones this check reads — chosen by _backend_pe_is_read, never a copy
     for pe in pe_conns:
         pe_props = pe.get("properties", {}) or {}
-        gids = _group_ids(pe_props)
+        gids = _pe_group_ids(pe_props)
         if not any("databricks_ui_api" in g for g in gids):
             continue
         state = ((pe_props.get("privateLinkServiceConnectionState", {}) or {}).get("status", ""))
@@ -1570,8 +1997,9 @@ def check_backend_private_link(workspace_network_cfg, vnet_id, arm_token=""):
             and _parse_resource_id(pe_id).get("resource_group") == _parse_resource_id(vnet_id).get("resource_group")
         )
         ui_api_pes.append((name, state, pe_id, rg_match))
+        if _backend_pe_is_read(pe_props):
+            approved.append(ui_api_pes[-1])
 
-    approved = [p for p in ui_api_pes if p[1] == "Approved"]
     can_verify = bool(arm_token)
 
     backend_pe_names, frontend_pe_names, unverified_pe_names, verification_errors = [], [], [], []
@@ -1779,6 +2207,14 @@ def check_outbound_to_databricks_com(route_table_check, nhc=None):
     md = route_table_check.metadata or {}
     default_route = md.get("default_route")
     target = route_table_check.target
+    if route_table_check.status == Status.ERROR:
+        # An UNREAD route table is not an empty one. Reading "no 0.0.0.0/0 override" off a
+        # route check that failed turned a permission gap into a PASS on the egress path.
+        return CheckResult("Outbound to www.databricks.com", target, Status.SKIP,
+            "Not checked — the route table could not be read, so whether outbound is forced "
+            "through an appliance is UNKNOWN.",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED},
+            duration_ms=(_time.time() - start) * 1000)
     if default_route is None:
         return CheckResult("Outbound to www.databricks.com", target, Status.PASS,
             "No 0.0.0.0/0 override — outbound to www.databricks.com uses default Azure Internet path.",
@@ -2109,6 +2545,12 @@ def check_forced_tunnel_firewall_egress(arm_token, route_check, nhc, workspace_r
     name = "Forced-Tunnel Firewall Egress"
     md = (route_check.metadata or {}) if route_check is not None else {}
     dr = md.get("default_route")
+    if route_check is not None and route_check.status == Status.ERROR:
+        return CheckResult(name, "(route table unread)", Status.SKIP,
+            "Not checked — the route table could not be read, so whether a firewall sits in "
+            "the egress path is UNKNOWN (not \"no forced tunnel\").",
+            metadata={SKIP_KIND_META: SKIP_UNVERIFIED},
+            duration_ms=(_time.time() - start) * 1000)
     if route_check is None or not dr or dr.get("next_hop_type") != "VirtualAppliance":
         return CheckResult(name, "(no forced tunnel)", Status.SKIP,
             "No 0.0.0.0/0 -> VirtualAppliance route; firewall egress analysis not applicable.",

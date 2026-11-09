@@ -10,7 +10,7 @@ and cluster_start_checks do. No %pip install / restartPython step is needed.
 import ipaddress as _ipaddress
 import time
 
-from models import CheckResult, Status
+from models import CheckResult, Status, SKIP_KIND_META, SKIP_UNVERIFIED
 from serverless_ncc_checks import infer_resource_type
 from storage_access_checks import get_arm_token
 # REUSE, don't re-implement: the cluster-start path already follows a subnet's own
@@ -23,6 +23,7 @@ from cluster_start_checks import (
     _route_prefix_net,
     check_forced_tunnel_firewall_egress,
     check_subnet_route_table,
+    record_arm_denial,
     service_tag_prefix_containing,
 )
 
@@ -168,6 +169,9 @@ def auto_discover_azure_context(client_id, client_secret, tenant_id="", resource
                     f"https://management.azure.com{workspace_arm_id}?api-version=2023-02-01",
                     headers=headers, timeout=15,
                 )
+                record_arm_denial(wsb.url if isinstance(getattr(wsb, "url", None), str)
+                                  else f"https://management.azure.com{workspace_arm_id}",
+                                  wsb.status_code, getattr(wsb, "text", ""))
                 if wsb.status_code == 200:
                     wsj = wsb.json()
                     result["workspace_id"] = wsj.get("id", workspace_arm_id)
@@ -389,6 +393,7 @@ class AzureInfraChecker:
                 self._token = self._mint_token()
                 continue
             if resp.status_code != 200:
+                record_arm_denial(url, resp.status_code, resp.text)
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             return resp.json()
         raise RuntimeError("unreachable")
@@ -1042,6 +1047,12 @@ class AzureInfraChecker:
         name = "Forced-Tunnel Firewall Egress"
         md = (subnet_egress_check.metadata or {}) if subnet_egress_check is not None else {}
         dr = md.get("default_route") or {}
+        if subnet_egress_check is not None and subnet_egress_check.status == Status.ERROR:
+            return CheckResult(name, "(route table unread)", Status.SKIP,
+                "Not checked — the data-plane subnet's route table could not be read, so "
+                "whether an appliance sits in the egress path is UNKNOWN.",
+                metadata={SKIP_KIND_META: SKIP_UNVERIFIED},
+                duration_ms=(time.time()-start)*1000)
         if dr.get("next_hop_type") != "VirtualAppliance":
             return CheckResult(name, "(no forced tunnel)", Status.SKIP,
                 "The data-plane subnet has no 0.0.0.0/0 -> VirtualAppliance route, so no "

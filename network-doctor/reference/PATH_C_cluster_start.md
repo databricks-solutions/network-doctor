@@ -40,7 +40,7 @@ The reachability decision is made deterministically in Step C3 (the driver probe
 
 - SERVICE_FAULT / `X_UnexpectedLaunchFailure` / "No such workerEnvironment" is a SYMPTOM — run the ARM diagnostic; never conclude "Databricks bug / open a ticket" before it has run clean against complete Reader scope (`launch_failure_arm_clean` is the honest pattern for that case, and even then confirm scope completeness first).
 - Azure cluster-start termination codes that ARE network-configuration failures (`NPIP_TUNNEL_SETUP_FAILURE` / Ngrok setup timeout, `NETWORK_CONFIGURATION_FAILURE`, `SUBNET_EXHAUSTED_FAILURE`, `CONTROL_PLANE_REQUEST_FAILURE`, `DRIVER_UNREACHABLE`, `SECURITY_DAEMON_REGISTRATION_EXCEPTION`) route to Path C even when the customer pastes only the bare code with no "won't start" prose.
-- **Credential-optional, honest:** no SP and the customer declines the scope walkthrough → Path C has no credential-free version, so say honestly that without a Reader SP you cannot inspect the Azure config; do NOT pattern-match the error text into a guessed cause. There is no offline path to offer.
+- **Credential-optional, honest:** no SP and the customer declines the credential (`none`) → the driver produces the Databricks-only report (see below). Say honestly that the Azure config was not inspected; do NOT pattern-match the error text into a guessed cause. There is no offline Azure path to offer.
 - `nhc_subnet_nsg_*` prescriptions present ALL options from the diagnosis (A AllRules / B back-end Private Link / C manual canonical rules); with `nhc_subnet_nsg_backend_pl_expected` never recommend AllRules — diagnose the back-end PL path (zone link, PE private IP, SCC, Premium) instead.
 
 ### LIVE flow
@@ -49,7 +49,7 @@ The driver runs `diagnose_cluster_start` LIVE (you do not hand-call it). Interna
 
 ### When ARM is unreachable (egress blocked)
 
-If this runtime cannot reach management.azure.com, the driver returns NEED_INPUT with the egress to enable — there is NO offline snapshot. A reachable-but-401/403 probe is a token/RBAC issue, not this case: it means grant the SP Reader, not change the network. When ARM is genuinely unreachable, relay to the customer: WHY (an EGRESS block, not a permissions problem and not a finding about their config); WHAT to enable — outbound HTTPS to `management.azure.com` and `login.microsoftonline.com` (serverless: Account Console > Settings > Network / NCC; classic: the data-plane subnet's route table / NSG / hub firewall); and that they should re-run for a LIVE diagnosis afterward. If their security policy forbids that egress, say the Azure layer stays uninspected rather than guessing.
+If this runtime cannot reach management.azure.com, the driver returns NEED_INPUT with the egress to enable — there is NO offline snapshot. A reachable-but-401/403 probe is a token/RBAC issue, not this case, and it is never a network change: the driver's read-access gate then says which it is — missing Reader on named scopes (`sp_gate`), or a token Azure rejected (check the secret and tenant id; Reader would not help). When ARM is genuinely unreachable, relay to the customer: WHY (an EGRESS block, not a permissions problem and not a finding about their config); WHAT to enable — outbound HTTPS to `management.azure.com` and `login.microsoftonline.com` (serverless: Account Console > Settings > Network / NCC; classic: the data-plane subnet's route table / NSG / hub firewall); and that they should re-run for a LIVE diagnosis afterward. If their security policy forbids that egress, say the Azure layer stays uninspected rather than guessing.
 
 ```python
 # After the customer enables egress, re-run the same session — the driver re-probes:
@@ -60,6 +60,16 @@ result = run_network_doctor(
 ```
 
 The report's checks are keyed `nhc_parse`, `ws_network_cfg`, `<public|private>_subnet_<delegation|nsg|routes|egress_ip>`, `ws_private_link`, `ws_backend_private_link`, `ws_private_dns`, `outbound_databricks_com`; diagnoses come from the correlation engine. Present per Step 6 (PATH_A_connectivity.md) + the Finalize-Turn rule in SKILL.md.
+
+### Service-principal access gate
+
+On a deep run, once the token exists and ARM is reachable, the driver checks — before any check runs — that the SP can READ every Azure scope the diagnosis uses: the workspace, its VNet, the subnets' NSG / route table / NAT gateway, every Connected peered VNet (including other subscriptions), the hub firewall the 0.0.0.0/0 route points to and its policy, and the workspace's private endpoints. The workspace's subscription is read only where something is listed across it: private DNS zones (only when public network access is Disabled), or Azure Firewalls when a forced-tunnel next hop cannot be pinned to one. Reader at resource-group level that covers every scope passes.
+
+On a gap the run STOPS with status NEED_INPUT and ONE question (`sp_gate`): the secret scope and SP application id, each missing scope with what lives there, and one `az role assignment create --role Reader --assignee <app-id> --scope <scope>` per scope. `result["sp_gate"]` carries `missing`, `commands` and `partial` (a refusal hid the next layer, so a retry may name more). No diagnosis is presented. The customer answers `retry` (re-check, then the deep run) or `simple` (continue without Azure); `cluster_id` is also accepted. Two replies that choose neither end the run with ERROR restating the scopes and both options. Throttling or 5xx during the check is ERROR "could not verify", never "grant Reader". An Azure 403 that surfaces mid-run discards the findings and returns the same question.
+
+### Databricks-only report (`simple`, or credential `none`)
+
+Reads only Databricks: the error text the customer gave (NHC parse) and, when a cluster id is known, the cluster's termination reason and recent events from the workspace API. It makes NO Azure call and runs no in-VNet probes. Every Azure row (workspace network config, back-end private link, subnet delegation / NSG / route table / egress IP, workspace private link, private DNS, forced-tunnel firewall) reads "Not checked — <reason>". The single diagnosis (`cluster_start_azure_not_checked`) says what failed in Databricks terms and never names an Azure object (NSG, route, firewall, peering, DNS zone, private endpoint) as the cause.
 
 ## NSG AllRules prescription (the primary fix for NoAzureDatabricksRules)
 

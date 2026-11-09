@@ -30,6 +30,7 @@ Use the same `run_network_doctor()` loop from Step 1b (NEED_INPUT -> IN_PROGRESS
 - Never ask for secret values. Ask only `sp_scope` (key names only if non-default).
 - If the SP is declined (`sp_declined=true`), be explicit: credential chain can be traced, but root cause cannot be confirmed without Reader SP (no fabricated verdict).
 - Keep credential-shaped strings out of the `run_network_doctor` call cell; in the common case pass only `answers={"sp_scope": "<scope>"}`.
+- On a deep run the driver checks, before any check, that the SP can read the storage account and its access connector (and, on classic with the workspace ARM id, the egress path: VNet, NSG, route table, peered VNets, hub firewall). A gap stops the run with ONE `sp_gate` question — relay it verbatim, scopes and `az role assignment create` commands included, with no diagnosis — and the customer answers `retry` or `simple`. If the SP sees no subscription at all, `storage_arm_id` (the storage account's resource id) is also accepted.
 - Finalize in the global order: confirmation questions (if any) -> `chat_prescription` -> `displayHTML(...)` -> dashboard pointer.
 - Re-verification after fixes also goes through the driver with a fresh call; do not rebuild a manual Path B check matrix in chat.
 

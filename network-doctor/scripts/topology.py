@@ -239,16 +239,27 @@ def _resolve_firewalls(topo, arm_token, default_sub=""):
     if not nva_ips:
         return
 
-    subs = _arm_get(arm_token, f"{_M}/subscriptions?api-version={_AV_SUB}")
+    subs = _arm_get(arm_token, f"{_M}/subscriptions?api-version={_AV_SUB}", record=False)
     if "_error" in subs:
-        sub_ids = [default_sub] if default_sub else []
-        _err(topo, f"could not list subscriptions ({subs['_error']}); limited firewall search to {sub_ids}")
+        sub_ids = []
+        _err(topo, f"could not list subscriptions ({subs['_error']}); searching only the "
+                   "subscriptions this graph already names")
     else:
         sub_ids = [s.get("subscriptionId") for s in subs.get("value", []) if s.get("subscriptionId")]
+    # The subscription list names only subscriptions where the SP holds a role AT
+    # subscription level or below — and an SP with Reader on two resource groups (spoke +
+    # hub) is listed under NEITHER. Searching only that list found zero firewalls for a
+    # principal that could read the firewall perfectly well. Always search the workspace's
+    # subscription and every subscription a VNet in this graph lives in (the peered hub).
+    for extra in [default_sub] + [_parse_resource_id(n["id"]).get("subscription_id", "")
+                                  for n in topo.nodes.values() if n["kind"] == "vnet"]:
+        if extra and extra not in sub_ids:
+            sub_ids.append(extra)
 
     resolved = set()
     for s_id in sub_ids:
-        fwl = _arm_get(arm_token, f"{_M}/subscriptions/{s_id}/providers/Microsoft.Network/azureFirewalls?api-version={_AV_FW}")
+        fwl = _arm_get(arm_token, f"{_M}/subscriptions/{s_id}/providers/Microsoft.Network/azureFirewalls?api-version={_AV_FW}",
+                       record=False)
         if "_error" in fwl:
             _err(topo, f"subscription {s_id}: azureFirewalls unreadable ({fwl['_error']}) "
                        "— grant the SP Reader on the hub firewall's subscription")
