@@ -1616,6 +1616,42 @@ _VERDICT_TAIL = {
                      "layer(s) that DO apply here could not be verified (listed below)."),
 }
 
+def _explained_by_present(check, report):
+    """Is this failing row one a diagnosis in THIS report explicitly accounts for?
+
+    The Databricks-only cluster-start report's termination row is a FAIL by fact (the
+    cluster did not start) and its no-verdict diagnosis is about exactly that row; listing
+    it again as "Unresolved — no diagnosis rule matched" contradicted the card above it and
+    doubled the chat. Opt-in per row (metadata `explained_by`), so every other failing row
+    still surfaces."""
+    by = (getattr(check, "metadata", None) or {}).get("explained_by")
+    return bool(by) and any(getattr(d, "pattern_id", "") == by
+                            for d in (getattr(report, "diagnoses", None) or []))
+
+
+def _verdict_tail(report, tail_key, counts):
+    """The headline's explanatory tail — one source for the chat prescription and summary.
+
+    The Databricks-only cluster-start report is the one shape where the generic WARN tail
+    ("Nothing I could prove is blocking this target") contradicts a row beside it: the
+    cluster's own termination reason is a FAIL row saying it could not start. There the
+    tail states what Databricks recorded and that the deciding Azure side was not read."""
+    if any(getattr(d, "pattern_id", "") == "cluster_start_azure_not_checked"
+           for d in (getattr(report, "diagnoses", None) or [])):
+        rows = report_rows(report)
+        term = ((((getattr(rows.get("cluster_termination"), "metadata", None) or {})
+                  .get("cluster_state") or {}).get("termination_reason") or {}).get("code") or "")
+        nhc_code = str(getattr(rows.get("nhc_parse"), "target", "") or "")
+        nhc_code = "" if nhc_code in ("(unknown)", term) else nhc_code
+        if term:
+            what = f" — Databricks recorded {term}" + (f": {nhc_code}" if nhc_code else "")
+        else:
+            what = f" — the error reads {nhc_code}" if nhc_code else ""
+        return (f"The cluster failed to start{what} — and the Azure network that decides why "
+                "was not checked, so no cause is named here.")
+    return _VERDICT_TAIL.get(tail_key, _VERDICT_TAIL["warn"]).format(skipped=counts["unverified"])
+
+
 _SEVERITY_NOTE = {
     "critical": "blocking",
     "high": "blocking",
@@ -2127,8 +2163,7 @@ def _chat_prescription(report):
     # D3 — gaps, not raw skips, in both the branch and the number (see _VERDICT_TAIL).
     # `counts` already carries both, from the one tally the dashboard banner also reads.
     tail_key = "pass_partial" if (overall == "pass" and counts["unverified"]) else overall
-    tail = _VERDICT_TAIL.get(tail_key, _VERDICT_TAIL["warn"]).format(
-        skipped=counts["unverified"])
+    tail = _verdict_tail(report, tail_key, counts)
     parts = [f"**Overall: {banner}** — {tail}\nTarget: `{report.target}`\n"
              + _counts_sentence(report)]
 
@@ -2161,9 +2196,11 @@ def _chat_prescription(report):
         # FAILED check is a contradiction the customer cannot resolve, and it is how a
         # real fault gets silently dropped (live on the healthy baseline:
         # peering=fail, zero diagnoses, prose claiming nothing was wrong).
-        if counts["fail"] or counts["error"]:
+        _unexplained = [c for c in report_rows(report).values()
+                        if status_value(c) in ("fail", "error") and not _explained_by_present(c, report)]
+        if _unexplained:
             action.append(
-                f"**Unresolved** — {counts['fail'] + counts['error']} check(s) did not pass and no "
+                f"**Unresolved** — {len(_unexplained)} check(s) did not pass and no "
                 "diagnosis rule matched them, so I will not tell you your setup is healthy. Review "
                 "the failing check(s) named below; if they are expected in your design, tell me and "
                 "I will note it. A failing check with no matching diagnosis is itself worth "
@@ -2356,7 +2393,7 @@ def _chat_summary(report):
         overall = "fail"
     banner, _ = headline_words(overall, counts)
     tail_key = "pass_partial" if (overall == "pass" and counts["unverified"]) else overall
-    tail = _VERDICT_TAIL.get(tail_key, _VERDICT_TAIL["warn"]).format(skipped=counts["unverified"])
+    tail = _verdict_tail(report, tail_key, counts)
     parts = [f"**Overall: {banner}** — {tail}\nTarget: `{report.target}` · " + _counts_sentence(report)]
 
     ranked = rank_diagnoses(report.diagnoses)
@@ -2386,11 +2423,13 @@ def _chat_summary(report):
         # neither controls nor can observe — so a customer whose cell did not paint was told
         # a count and nothing else.
         _bad = [f"{_check_label(_k, _c)} — {(getattr(_c, 'message', '') or '').strip()}"
-                for _k, _c in checks.items() if status_value(_c) in ("fail", "error")]
+                for _k, _c in checks.items() if status_value(_c) in ("fail", "error")
+                and not _explained_by_present(_c, report)]
         _list = ("\n" + "\n".join("- " + _b for _b in _bad)) if _bad else ""
-        parts.append(f"**Unresolved** — {counts['fail'] + counts['error']} check(s) did not pass and no "
-                     "diagnosis rule matched them, so I will not tell you the setup is "
-                     f"healthy.{_list}")
+        if _bad:
+            parts.append(f"**Unresolved** — {len(_bad)} check(s) did not pass and no "
+                         "diagnosis rule matched them, so I will not tell you the setup is "
+                         f"healthy.{_list}")
 
     # Actionable warning rows NAMED (not just counted); their fix detail is in the dashboard.
     warn_action = [_check_label(k, c) for k, c in checks.items()
@@ -2504,8 +2543,15 @@ def _summary_word_budget(report):
     # is rendered once however many rows carry it). The budget must fit the longest
     # legitimate fix — it guards against a regression that balloons the summary, it must
     # never be a cap that forces truncating an instruction.
+    # With no ranked cause, _chat_summary renders the ONE could-not-conclude card instead
+    # (storage_needs_sp, the Databricks-only cluster-start report): same shape as a cause —
+    # title, one-line why, the step that would settle it — so it gets a cause's budget.
+    unsettled = 0 if ranked else min(1, sum(
+        1 for d in (report.diagnoses or [])
+        if getattr(d, "pattern_id", "") != "all_healthy"
+        and (getattr(d, "pattern_id", "") or getattr(d, "title", "")) in cannot_conclude(report.diagnoses)))
     return (120                                  # verdict, target, counts, deferred line, verification
-            + 160 * len(causes)                  # title + one-line why + a complete fix
+            + 160 * (len(causes) + unsettled)    # title + one-line why + a complete fix
             + 12 * warn_action                   # one named warning
             + 45 * min(handoffs, 1))             # the one-line hand-off
 
@@ -3385,9 +3431,10 @@ def _gate_assignee(g, a=None):
     if oid:
         return f"--assignee-object-id {oid} --assignee-principal-type ServicePrincipal"
     # No object id in the token (never seen, but never print a secret-scope value as the
-    # fallback either: it would reach the customer as [REDACTED]).
-    return ("--assignee-object-id <OBJECT-ID: Entra admin center > Enterprise applications > "
-            "your service principal > Object ID> --assignee-principal-type ServicePrincipal")
+    # fallback either: it would reach the customer as [REDACTED]). A shell variable, not
+    # `<...>`: pasted as-is, `<` and `>` are redirections and create stray files; an unset
+    # variable just makes az refuse the command.
+    return '--assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal'
 
 
 def _gate_commands(g, a=None):
@@ -3448,7 +3495,11 @@ def _sp_gate_question(s, short=False):
         "Missing read access — role needed: **Reader** (read-only):\n"
         + "\n".join(lines) + more + "\n\n"
         + (("To grant it, someone who can assign roles on those scopes (Owner or User Access "
-            "Administrator) runs:\n```\n" + "\n".join(_gate_commands(g, a)) + "\n```\n"
+            "Administrator) runs"
+            + ("" if g.get("object_id") else
+               " — first set `SP_OBJECT_ID` to the service principal's Object ID (Entra admin "
+               "center → Enterprise applications → your service principal → Object ID)")
+            + ":\n```\n" + "\n".join(_gate_commands(g, a)) + "\n```\n"
             "A new role assignment can take a few minutes to apply.\n\n") if _gate_commands(g, a)
            else "\n")
         + 
@@ -4157,9 +4208,8 @@ def _stage_C(s, path):
             _partial = bool((a.get(_SP_GATE) or {}).get("partial"))
             fix = ["To get the cause: grant the service principal Reader on "
                    + ("at least " if _partial else "") + _gate_scope_phrase(a)
-                   + (" (more may be named once those are readable)" if _partial else "")
-                   + " and run the diagnosis again — that run reads the Azure network and names "
-                     "the exact object and the change to make."]
+                   + " and run me again — that run reads the Azure network and names the "
+                     "object and the change."]
         else:
             reason = "no Azure credential was provided"
             fix = ["To get the cause: run the diagnosis again with a read-only (Reader) service "

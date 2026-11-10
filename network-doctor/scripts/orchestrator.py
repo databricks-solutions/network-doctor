@@ -1933,6 +1933,29 @@ _CLUSTER_START_AZURE_ROWS = (
 )
 
 
+def _last_start_chain(events):
+    """`STARTING → ADD_NODES_FAILED → TERMINATING (NETWORK_CONFIGURATION_FAILURE)` — the
+    most recent start attempt, oldest first, in one line. The events API answers newest
+    first and spans earlier start cycles; pasting the raw event dicts put Python reprs in
+    front of the customer and blew the chat's word budget (live)."""
+    seq = list(reversed(events or []))
+    starts = [i for i, e in enumerate(seq) if str(e.get("type")) in ("STARTING", "CREATING", "RESTARTING")]
+    seq = seq[starts[-1]:] if starts else seq[-5:]
+    names = []
+    for e in seq:
+        t = str(e.get("type") or "")
+        if t and (not names or names[-1] != t):
+            names.append(t)
+    if not names:
+        return ""
+    last_code = ""
+    for e in reversed(seq):
+        last_code = (((e.get("details") or {}).get("reason") or {}).get("code") or "")
+        if last_code:
+            break
+    return " → ".join(names) + (f" ({last_code})" if last_code else "")
+
+
 def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id="",
                                            cluster_state=None, not_checked_reason="",
                                            prescription=None):
@@ -1952,8 +1975,17 @@ def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id
     read, and naming one is exactly the wrong answer the read-access gate exists to stop.
     """
     from models import Diagnosis, Severity
-    nhc = parse_nhc_error(nhc_error_text)
-    reason = (not_checked_reason or "no Azure credential was used, so the Azure network "
+    cs = cluster_state or {}
+    tr = cs.get("termination_reason") or {}
+    # The cluster's OWN termination reason carries the full health-check text (error code,
+    # failed components, the endpoints it could not reach). It is the more specific fact:
+    # the problem text is often just "our cluster won't start" (live: the verdict quoted
+    # CLUSTER_NEVER_STARTED from the prose while the API said X_NHC_STORAGE_SSL_ERROR).
+    api_text = str((tr.get("parameters") or {}).get("databricks_error_message") or "")
+    api_nhc = parse_nhc_error(api_text) if api_text else {}
+    nhc = (api_nhc if (api_nhc.get("error_code") or api_nhc.get("failed_components"))
+           else parse_nhc_error(nhc_error_text))
+    reason = (not_checked_reason or "no Azure credential was provided, so the Azure network "
               "configuration was not read")
     target = (workspace_resource_id or "").rstrip("/").split("/")[-1] or "(cluster start)"
     completed = {}
@@ -1965,20 +1997,21 @@ def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id
                  f"failed_components={nhc.get('failed_components') or []} ; "
                  f"{len(nhc.get('entities') or [])} entity(ies)"),
         metadata=nhc)
-    cs = cluster_state or {}
     if cs.get("cluster_id"):
-        tr = cs.get("termination_reason") or {}
         bits = [f"state={cs.get('state') or '?'}"]
         if tr.get("code"):
-            bits.append(f"termination_reason={tr.get('code')} ({tr.get('type') or '?'})")
-        if cs.get("state_message"):
-            bits.append(f"\"{str(cs['state_message'])[:300]}\"")
-        for ev in (cs.get("events") or [])[:5]:
-            bits.append(f"event {ev.get('type')}: {str(ev.get('details') or '')[:160]}")
+            bits.append(f"termination_reason={tr.get('code')} ({tr.get('type') or '?'})"
+                        + (f": {api_nhc['error_code']}" if api_nhc.get("error_code") else ""))
+        elif cs.get("state_message"):
+            bits.append('"' + str(cs["state_message"])[:160] + '"')
+        chain = _last_start_chain(cs.get("events") or [])
+        if chain:
+            bits.append("last start: " + chain)
         completed["cluster_termination"] = CheckResult(
             check_name="Cluster Termination Reason", target=cs["cluster_id"],
             status=Status.FAIL if tr.get("code") else Status.WARN,
-            message=" ; ".join(bits), metadata={"cluster_state": cs})
+            message=" ; ".join(bits),
+            metadata={"cluster_state": cs, "explained_by": "cluster_start_azure_not_checked"})
     elif cs.get("error"):
         completed["cluster_termination"] = CheckResult(
             check_name="Cluster Termination Reason", target=cs.get("cluster_id_asked") or "(cluster)",
@@ -1998,12 +2031,14 @@ def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id
         evidence.append("endpoints the bootstrap could not reach: " + ", ".join(unreached[:8]))
     if cs.get("termination_reason", {}).get("code"):
         evidence.append(f"Databricks termination reason: {cs['termination_reason']['code']}")
+    if tr.get("code") and tr["code"] not in code:
+        code = f"{tr['code']}: {code}" if code else tr["code"]
     what = ", ".join(x for x in (code, f"component: {failed}" if failed else "") if x)
     # The FIRST sentence carries the whole verdict, because the chat keeps only that one:
     # what failed, and that the layer deciding it was not read.
-    root = ("The cluster's start-up check failed" + (f" ({what})" if what else "")
-            + ", and the Azure network that decides this was not read on this run, so no "
-              "layer or object is named as the cause. "
+    root = ("The cluster's start-up check failed" + (f" ({code})" if code else "")
+            + "; the Azure network that decides this was not read, so no cause is named. "
+            + (f"Failed component(s): {failed}. " if failed else "")
             + (f"The bootstrap could not reach {', '.join(unreached[:4])}. " if unreached else "")
             + f"Not read because {reason}.")
     diag = Diagnosis(

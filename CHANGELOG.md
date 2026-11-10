@@ -23,6 +23,13 @@ Quote it if you need help with a result.
 
 ### Fixed
 
+- **The grant command in the access check runs as printed.** It names the service
+  principal by its object id. Before, it used the application id from your secret scope,
+  which Databricks hides in notebook output, so the command showed `[REDACTED]`.
+- **The cluster-start report without Azure reads quotes what Databricks recorded.** It uses
+  the cluster's own termination reason and health-check code, shows its last start as one
+  line of events, and its headline says the start failed instead of "nothing blocking".
+
 - **An unreadable route table is no longer reported as clean.** "Outbound to www.databricks.com"
   and "Forced-Tunnel Firewall Egress" now say "Not checked" instead of passing.
 - **The firewall and storage account are now found with Reader on resource groups only.** The
