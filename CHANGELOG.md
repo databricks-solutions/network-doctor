@@ -20,6 +20,8 @@ Quote it if you need help with a result.
   question, or answering `none` to the credential, reads only your error text and the
   cluster's termination reason and events from Databricks. Every Azure row says "Not checked"
   and the diagnosis never blames an Azure object. Before, `none` produced a failed Azure read.
+  If you name the cluster in your message, it is found by name; otherwise you are asked
+  once for its id.
 
 ### Fixed
 

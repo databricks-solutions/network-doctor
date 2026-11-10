@@ -1985,8 +1985,7 @@ def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id
     api_nhc = parse_nhc_error(api_text) if api_text else {}
     nhc = (api_nhc if (api_nhc.get("error_code") or api_nhc.get("failed_components"))
            else parse_nhc_error(nhc_error_text))
-    reason = (not_checked_reason or "no Azure credential was provided, so the Azure network "
-              "configuration was not read")
+    reason = not_checked_reason or "no Azure credential was provided"
     target = (workspace_resource_id or "").rstrip("/").split("/")[-1] or "(cluster start)"
     completed = {}
     code = nhc.get("error_code") or ", ".join(nhc.get("launch_failure_signatures") or [])
@@ -2040,7 +2039,7 @@ def diagnose_cluster_start_databricks_only(nhc_error_text, workspace_resource_id
             + "; the Azure network that decides this was not read, so no cause is named. "
             + (f"Failed component(s): {failed}. " if failed else "")
             + (f"The bootstrap could not reach {', '.join(unreached[:4])}. " if unreached else "")
-            + f"Not read because {reason}.")
+            + f"Not read: {reason}.")
     diag = Diagnosis(
         pattern_id="cluster_start_azure_not_checked",
         title="Cluster start failed — the Azure network side was not checked",

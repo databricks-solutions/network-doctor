@@ -71,9 +71,10 @@ description: >
   offer AFTER the probes have produced a finding, even under `simple` — that is by
   design, so relay it; it is the only ask `simple` leaves alive. Path C is NOT asked
   the depth question at intake; if the driver did not ask, do not invent it. Path C
-  still has a lighter run: the access gate (3c) offers `simple`, and `none` to the
-  credential gives the same Databricks-only report (no Azure call).
-  (3c) **`sp_gate` questions are relayed VERBATIM, scope list and commands included.**
+  still has a lighter run: the access gate (3d) offers `simple`, and `none` to the
+  credential gives the same Databricks-only report (no Azure call) — pass the failing
+  cluster's `cluster_id` with that `none` when the customer gives one.
+  (3d) **`sp_gate` questions are relayed VERBATIM, scope list and commands included.**
   On a deep run the driver checks that the service principal can READ every Azure scope
   the diagnosis uses. On a gap it STOPS with ONE NEED_INPUT question whose answer key is
   `sp_gate`. Relay it exactly: the scopes and what lives in each, and every
@@ -85,6 +86,12 @@ description: >
   reading Azure); on Path C add `cluster_id` if they give one. A retry may name more
   scopes (`partial`) — relay again. This is not the egress-block case: "ARM unreachable"
   stays its own question and is not a permissions finding.
+  (3e) **A credential you remember is still the customer's to confirm.** If you fill
+  `sp_scope` (or any credential key) from your memory of an earlier conversation rather
+  than from the customer's reply, say so in ONE line before the call — "I'll use the
+  service principal in secret scope `X` from before; say if you want another one, or
+  `none`" — and let them correct it. The driver cannot tell a remembered value from a
+  typed one, so this is yours to say; every gate stop also names the scope it used.
   (4) Always cite which check returned which status when stating a cause
   (e.g., "public_subnet_nsg returned FAIL with missing_tags=['AzureDatabricks']").
   If you have not run a check, you do not know.

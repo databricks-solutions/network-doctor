@@ -1451,7 +1451,15 @@ def _all_missing_questions(s):
                            "Path C cannot run without it — answer `none` only if you cannot provide "
                            "it, and I will stop rather than guessing from the error text.")})
         if not a.get("sp_scope") and not a.get("sp_declined"):
-            qs.append(dict(_SP_QUESTION))
+            # `none` here leads to the Databricks-only report, whose most specific fact is
+            # the failing cluster's own termination reason — so the decline turn has to be
+            # able to CARRY the cluster id (live: "the answer is none, the cluster id is
+            # 1019-…" was dropped because no key accepted it).
+            qs.append(dict(_SP_QUESTION, ids=list(_SP_QUESTION["ids"]) + ["cluster_id"],
+                           question=_SP_QUESTION["question"] + (
+                               " If you answer `none`, also send the failing cluster's id as "
+                               "`cluster_id` and I'll read its termination reason from "
+                               "Databricks.")))
     elif s["path"] == "B":
         # a storage ACCOUNT or the failing HOST is a first-class Path B target.
         # A customer who has to go back to the analyst for the exact table name still
@@ -3671,12 +3679,97 @@ def _mint_for_gate(a):
 
 
 def _cluster_id_for_c(s):
+    """The failing cluster's id: the answer, else one written in the problem text or in a
+    reply the normalizer could not use as an id ("the cluster id is 1019-…")."""
     a = s["answers"]
     cid = str(a.get("cluster_id") or "").strip()
     if _CLUSTER_ID_RE.match(cid):
         return cid
-    m = _re.search(r"\b([0-9]{4}-[0-9]{6}-[A-Za-z0-9_]{4,})\b", s.get("problem") or "")
-    return m.group(1) if m else ""
+    for text in (s.get("problem") or "", str(a.get("_cluster_id_unparsed") or "")):
+        m = _re.search(r"\b([0-9]{4}-[0-9]{6}-[A-Za-z0-9_]{4,})\b", text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+_C_CLUSTER_ASKED = "_c_cluster_asked"
+
+
+def _cluster_named_in(text):
+    """The id of the ONE workspace cluster whose name the problem text uses ("our cluster
+    etl-classic won't start"), else "" — none named, several named, or a name shared by
+    several clusters. Databricks workspace API (clusters/list), never Azure. A whole-name
+    match only: `etl` does not match inside `etl-classic`, so a short name cannot capture
+    a longer one, and a guess is never made between two candidates."""
+    text = str(text or "")
+    if not text.strip():
+        return ""
+    try:
+        import requests as _req
+        ws = get_workspace_context() or {}
+        base, tok = ws.get("workspace_url", ""), ws.get("token", "")
+        if not (base and tok):
+            return ""
+        if not base.startswith("http"):
+            base = f"https://{base}"
+        clusters, page = [], ""
+        for _ in range(5):
+            params = {"page_size": 100}
+            if page:
+                params["page_token"] = page
+            r = _req.get(f"{base}/api/2.1/clusters/list", params=params,
+                         headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+            if r.status_code != 200:
+                return ""
+            body = r.json() or {}
+            clusters += body.get("clusters") or []
+            page = body.get("next_page_token") or ""
+            if not page:
+                break
+    except Exception:
+        return ""
+    hits = {}
+    for c in clusters:
+        name = str(c.get("cluster_name") or "").strip()
+        if len(name) >= 3 and _re.search(r"(?<![\w-])" + _re.escape(name) + r"(?![\w-])",
+                                         text, _re.IGNORECASE):
+            hits.setdefault(name.lower(), []).append(c.get("cluster_id"))
+    ids = [i for v in hits.values() for i in v if i]
+    return ids[0] if len(ids) == 1 else ""
+
+
+def _ask_cluster_for_c(s, path):
+    """Ask ONCE for the failing cluster's id before the Databricks-only report, when none is
+    known. Its termination reason is the most specific fact that report can carry; without
+    it the verdict falls back to the customer's prose. Not asked after the gate's `simple`
+    (that question already asked for it), and `none` — or any second reply — proceeds."""
+    a = s["answers"]
+    if (_cluster_id_for_c(s) or str(a.get("cluster_id") or "").lower() == "none"
+            or a.get(_SP_GATE_CHOICE) == "simple" or a.get(_C_CLUSTER_ASKED)):
+        return None
+    # The customer often NAMES the cluster instead of quoting its id. One exact match among
+    # the workspace's clusters settles it without a question; anything else is asked.
+    named = _cluster_named_in(s.get("problem"))
+    if named:
+        a["cluster_id"] = named
+        a["_cluster_id_from_name"] = True
+        _save_session(s, path)
+        print(f"[Doctor] The problem text names exactly one cluster of this workspace — using "
+              f"{named} to read its termination reason (no question needed).")
+        return None
+    a[_C_CLUSTER_ASKED] = True
+    _save_session(s, path)
+    q = {"ids": ["cluster_id"], "question": (
+        "I'll report what Databricks itself recorded about the failed start, without reading "
+        "Azure. The most useful part is the cluster's own termination reason and event log: "
+        "what is the failing cluster's id? (Compute > the cluster > the id in its URL, e.g. "
+        "`1019-180626-opv8k3gh`.) Or answer `none` and I'll work from the error text alone.")}
+    next_call = f"run_network_doctor(answers={{...}}, session_path=r'{path}')"
+    print("[Doctor] NEED_INPUT (path C) — RELAY this ONE question VERBATIM and WAIT:")
+    print(f"[Doctor]   - {q['question']}")
+    print(f"[Doctor]   {next_call}  # fill: {{'cluster_id': '<id>'}} or {{'cluster_id': 'none'}}")
+    return _decorate({"status": "NEED_INPUT", "session_path": path, "path": "C",
+                      "questions": [q], "next_step": _safe_cell(next_call)}, "C")
 
 
 def _cluster_state(cluster_id):
@@ -4215,6 +4308,9 @@ def _stage_C(s, path):
             fix = ["To get the cause: run the diagnosis again with a read-only (Reader) service "
                    "principal — that run reads the Azure network and names the exact object and "
                    "the change to make."]
+        ask = _ask_cluster_for_c(s, path)
+        if ask is not None:
+            return ask
         print("[Doctor] Path C WITHOUT Azure reads — " + reason + ". Reporting what Databricks "
               "recorded about the failed start; every Azure layer is NOT CHECKED, and no "
               "Azure object is named as the cause.")
