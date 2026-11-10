@@ -3362,11 +3362,39 @@ def _gate_scope_phrase(a):
     return ", ".join(f"`{x}`" for x in scopes[:4]) + (" and more" if len(scopes) > 4 else "")
 
 
-def _gate_commands(g):
+def _sp_object_id(token):
+    """The service principal's OBJECT id, from the `oid` claim of its own ARM token.
+
+    Why not the application (client) id: it comes out of the secret scope, and Databricks
+    redacts every printed string equal to a secret value — so the grant command reached the
+    customer as `--assignee [REDACTED]` (live, run 2) and the relay improvised a
+    placeholder. The object id is not stored in the scope, so it prints as itself, and
+    `--assignee-object-id` is the exact form `az role assignment create` takes for it."""
+    import base64
+    try:
+        part = str(token or "").split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        oid = str(claims.get("oid") or "")
+        return oid if _re.match(r"^[0-9a-fA-F-]{36}$", oid) else ""
+    except Exception:
+        return ""
+
+
+def _gate_assignee(g, a=None):
+    oid = (g or {}).get("object_id") or ""
+    if oid:
+        return f"--assignee-object-id {oid} --assignee-principal-type ServicePrincipal"
+    # No object id in the token (never seen, but never print a secret-scope value as the
+    # fallback either: it would reach the customer as [REDACTED]).
+    return ("--assignee-object-id <OBJECT-ID: Entra admin center > Enterprise applications > "
+            "your service principal > Object ID> --assignee-principal-type ServicePrincipal")
+
+
+def _gate_commands(g, a=None):
     """One Reader grant per missing scope — except a scope in ANOTHER Entra tenant, where
     a Reader grant to this principal is not the fix (it does not exist there)."""
-    app = g.get("app_id") or "<application-id-of-the-service-principal>"
-    return [f"az role assignment create --role Reader --assignee {app} "
+    who = _gate_assignee(g, a)
+    return [f"az role assignment create --role Reader {who} "
             f"--scope {m.get('grant_scope') or m['scope']}" for m in (g.get("missing") or [])
             if not m.get("other_tenant")]
 
@@ -3412,15 +3440,16 @@ def _sp_gate_question(s, short=False):
                  "/subscriptions/...), or grant Reader on the subscription that holds it.")
     return (
         "I stopped before diagnosing anything. The service principal in secret scope "
-        f"`{scope_name}` (application id `{g.get('app_id') or '?'}`) cannot read every part "
+        f"`{scope_name}`" + (f" (object id `{g['object_id']}`)" if g.get("object_id") else "")
+        + " cannot read every part "
         "of your Azure configuration that this diagnosis reads — and a route, firewall or "
         "DNS zone it cannot see looks exactly like one that is not there, so any root cause "
         "I named now could be wrong.\n\n"
         "Missing read access — role needed: **Reader** (read-only):\n"
         + "\n".join(lines) + more + "\n\n"
         + (("To grant it, someone who can assign roles on those scopes (Owner or User Access "
-            "Administrator) runs:\n```\n" + "\n".join(_gate_commands(g)) + "\n```\n"
-            "A new role assignment can take a few minutes to apply.\n\n") if _gate_commands(g)
+            "Administrator) runs:\n```\n" + "\n".join(_gate_commands(g, a)) + "\n```\n"
+            "A new role assignment can take a few minutes to apply.\n\n") if _gate_commands(g, a)
            else "\n")
         + 
         "Then answer `retry` and I'll check the access again before diagnosing. Or answer "
@@ -3438,7 +3467,7 @@ def _emit_sp_gate(s, path):
         a[_ASK_COUNTS] = counts
     a[_LAST_ASKED] = "sp_gate"
     _save_session(s, path)
-    cmds = _gate_commands(g)
+    cmds = _gate_commands(g, a)
     if int(counts.get("sp_gate") or 0) >= _MAX_UNANSWERED_ASKS:
         print("[Doctor] Asked twice to choose `retry` or `simple` after the read-access gate "
               "failed, and neither came back. STOPPING — no diagnosis exists to present.")
@@ -3519,16 +3548,16 @@ def _run_sp_gate(s, path, tok, sp, list_dns_zones=False, extra=(), workspace_id=
         }, s["path"])
     if g["status"] == "pass":
         a[_SP_GATE] = {"status": "pass", "key": key, "checked": g["checked"],
-                       "app_id": (sp or {}).get("client_id", "")}
+                       "object_id": _sp_object_id(tok)}
         a.pop(_SP_GATE_REPLY, None)
         _save_session(s, path)
         return None
     a[_SP_GATE] = {"status": "fail", "key": key, "missing": g["missing"],
-                   "partial": bool(g["partial"]), "app_id": (sp or {}).get("client_id", "")}
+                   "partial": bool(g["partial"]), "object_id": _sp_object_id(tok)}
     return _emit_sp_gate(s, path)
 
 
-def _gate_from_denials(s, path, sp, denials):
+def _gate_from_denials(s, path, object_id, denials):
     """The checks themselves hit a 403 the gate did not foresee. Discard what they found
     (it was built on an unread scope) and stop exactly as the gate does."""
     a = s["answers"]
@@ -3554,7 +3583,7 @@ def _gate_from_denials(s, path, sp, denials):
             learned.append(item)
     a[_SP_GATE_EXTRA] = learned
     a[_SP_GATE] = {"status": "fail", "key": _gate_key(a), "partial": True,
-                   "app_id": (sp or {}).get("client_id", ""),
+                   "object_id": object_id or "",
                    "missing": [{"scope": sc, "holds": e["holds"], "evidence": sorted(set(e["evidence"])),
                                 "other_tenant": e["other_tenant"]}
                                for sc, e in sorted(by_scope.items())]}
@@ -4001,7 +4030,7 @@ def _stage_A(s, path):
         drain_arm_denials()
         continue_diagnosis(s["checkpoint_path"], ctx)
         denials = drain_arm_denials()
-        stop = (_gate_from_denials(s, path, {"client_id": _sp_app_id(a)}, denials)
+        stop = (_gate_from_denials(s, path, _sp_object_id_for(a), denials)
                 if denials and _sp_refs(a) else None)
         if stop is not None:
             # Built on a scope the SP could not read: discard it whole, and stop as the
@@ -4027,15 +4056,14 @@ def _stage_A(s, path):
     report = finalize_diagnosis(s["checkpoint_path"], _ctx_for_A(s))
     return _present(s, path, report)
 
-def _sp_app_id(a):
-    """The SP's application (client) id, for the grant commands. Not a secret."""
-    known = (a.get(_SP_GATE) or {}).get("app_id")
+def _sp_object_id_for(a):
+    """The SP's object id for the grant commands: from the gate's verdict when it ran,
+    else from a freshly minted token (the A infra phase mints its own and keeps it)."""
+    known = (a.get(_SP_GATE) or {}).get("object_id")
     if known:
         return known
-    try:
-        return load_azure_sp_from_secrets(_get_dbutils(), _sp_refs(a)).get("client_id", "")
-    except Exception:
-        return ""
+    _sp, tok, _err = _mint_for_gate(a)
+    return _sp_object_id(tok) if tok else ""
 
 
 def _gate_for_A(s, path):
@@ -4061,7 +4089,7 @@ def _gate_for_A(s, path):
     gate = _run_sp_gate(s, path, tok, sp, list_dns_zones=True)
     if isinstance(gate, dict) or gate is None:
         if gate is None:
-            (a.get(_SP_GATE) or {}).setdefault("app_id", sp.get("client_id", ""))
+            (a.get(_SP_GATE) or {}).setdefault("object_id", _sp_object_id(tok))
             _save_session(s, path)
         return gate
     return None
@@ -4183,7 +4211,7 @@ def _stage_C(s, path):
     drain_arm_denials()
     report = diagnose_cluster_start(s["problem"], arm_id, arm_token=tok["token"])
     denials = drain_arm_denials()
-    stop = _gate_from_denials(s, path, sp, denials) if denials else None
+    stop = _gate_from_denials(s, path, _sp_object_id(tok["token"]), denials) if denials else None
     if stop is not None:
         return stop
     return _present(s, path, report)
@@ -4583,7 +4611,7 @@ def _stage_B(s, path):
                "can list and the account is in none of them — it may sit in a subscription where "
                "the principal holds only resource-group roles, or the account name may be wrong")
         a[_SP_GATE] = {"status": "fail", "key": _gate_key(a), "partial": True,
-                       "app_id": sp.get("client_id", ""), "needs_storage_id": True,
+                       "object_id": _sp_object_id(tok), "needs_storage_id": True,
                        "missing": [{
                            "scope": f"the storage account `{target['account']}`",
                            "grant_scope": f"$(az storage account show --name {target['account']} --query id -o tsv)",
@@ -4706,7 +4734,7 @@ def _stage_B(s, path):
             metadata={"egress_trace": True, **_gate}))
 
     denials = drain_arm_denials()
-    stop = _gate_from_denials(s, path, sp, denials) if denials else None
+    stop = _gate_from_denials(s, path, _sp_object_id(tok), denials) if denials else None
     if stop is not None:
         return stop
     diagnoses = (_compose_storage_diagnosis(fqdn, fw, nsp, ac_in_rules, roles, ac_id,
